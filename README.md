@@ -13,6 +13,12 @@ Choose Beginner (9x9/10), Intermediate (16x16/40), Advanced (16x30/99),
 or Custom. Adjust custom dimensions and mines, then select **New game**.
 The first revealed cell is always safe.
 
+- The game header displays `gfx/Makibishi Sweeper.png`, fitted to the available
+  width while preserving its aspect ratio.
+- Covered, flagged and revealed-mine tiles use the pixel-art images in `gfx/`,
+  scaled with nearest-neighbor sampling. Covered tiles select `tile-0.png` through
+  `tile-3.png` using a fixed coordinate hash, keeping the pattern stable across
+  redraws, zoom changes and new games.
 - Left click: reveal; click a revealed number to chord when adjacent flags match.
 - Right click: toggle a flag.
 - Middle click or left+right together: chord a revealed number when adjacent
@@ -31,6 +37,13 @@ The first revealed cell is always safe.
   misplaced chord flag), the time, whether the score was recorded online, and the
   leaderboard place achieved (or that it would have achieved for unrecorded wins).
   **Escape** dismisses it.
+- If the connection fails during a ranked game, the client retries automatically
+  with backoff (1, 2, 4, 8, then every 15 s). After a failed move it reloads the
+  board first and resends the move only if the server never applied it, so a
+  flag is never toggled twice. From the second failure a "Connection problem"
+  popup hides the board: **Enter** retries now, **Escape** stops (abandoning the
+  ranked game for offline play, or leaving **Submit score** for an unsaved win).
+  The ranked clock is server-side and keeps running while disconnected.
 - Mines, time, ranking status, flag mode and fullscreen controls share the fixed
   bottom status bar with network messages and errors.
 

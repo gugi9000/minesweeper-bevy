@@ -93,6 +93,7 @@ pub struct Leaderboards {
     pub advanced: Vec<Score>,
 }
 
+#[derive(Clone)]
 pub enum Operation {
     Restore,
     Login {
@@ -131,6 +132,8 @@ pub enum Reply {
 pub struct ApiError {
     pub message: String,
     pub unauthorized: bool,
+    /// Transport failures and temporary server errors that may succeed when repeated.
+    pub retryable: bool,
 }
 
 impl From<String> for ApiError {
@@ -138,6 +141,7 @@ impl From<String> for ApiError {
         Self {
             message,
             unauthorized: false,
+            retryable: false,
         }
     }
 }
@@ -225,6 +229,7 @@ impl Api {
             token.ok_or_else(|| ApiError {
                 message: "Sign in before starting an online game.".into(),
                 unauthorized: true,
+                retryable: false,
             })
         };
         match operation {
@@ -350,20 +355,28 @@ impl Api {
 }
 
 fn response<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, ApiError> {
-    let response = request
-        .send()
-        .map_err(|error| ApiError::from(format!("Network request failed: {error}")))?;
+    let response = request.send().map_err(|error| ApiError {
+        message: format!("Cannot reach the server: {}", error.without_url()),
+        unauthorized: false,
+        retryable: true,
+    })?;
     let status = response.status();
     if !status.is_success() {
-        let message = response
-            .text()
-            .map_err(|error| ApiError::from(format!("Cannot read server error: {error}")))?;
+        let retryable = status.is_server_error()
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT;
+        let message = response.text().map_err(|error| ApiError {
+            message: format!("Cannot read server error: {}", error.without_url()),
+            unauthorized: false,
+            retryable,
+        })?;
         return Err(ApiError {
             message: format!(
                 "Server error {status}: {}",
                 message.chars().take(300).collect::<String>()
             ),
             unauthorized: status == reqwest::StatusCode::UNAUTHORIZED,
+            retryable,
         });
     }
     response
@@ -389,6 +402,8 @@ pub struct Online {
     pub remember: bool,
     pub submitted: bool,
     pub needs_refresh: bool,
+    /// Last dispatched game request (never login), kept so failures can be retried.
+    pub last_game_operation: Option<Operation>,
 }
 
 impl Default for Online {
@@ -416,6 +431,7 @@ impl Default for Online {
             remember: false,
             submitted: false,
             needs_refresh: false,
+            last_game_operation: None,
         }
     }
 }
@@ -437,6 +453,14 @@ impl Online {
             }
         };
         let token = self.session.as_ref().map(|s| s.token.clone());
+        let game_operation = matches!(
+            operation,
+            Operation::Start { .. }
+                | Operation::Move { .. }
+                | Operation::Refresh { .. }
+                | Operation::Submit { .. }
+        )
+        .then(|| operation.clone());
         let (sender, receiver) = mpsc::channel();
         match std::thread::Builder::new()
             .name("minesweeper-network".into())
@@ -447,6 +471,7 @@ impl Online {
             }) {
             Ok(_) => {
                 self.pending = Some(Mutex::new(receiver));
+                self.last_game_operation = game_operation;
                 self.message = "Contacting server...".into();
             }
             Err(error) => self.message = format!("Cannot start network worker: {error}"),

@@ -28,6 +28,52 @@ struct Game {
     board_scroll: Vec2,
     last_move: Option<(usize, &'static str)>,
     game_over: Option<GameOver>,
+    connection: Option<ConnectionLost>,
+    tile_images: Option<TileImages>,
+    banner: Handle<Image>,
+}
+
+struct TileImages {
+    covered: [Handle<Image>; 4],
+    flagged: Handle<Image>,
+    mine: Handle<Image>,
+}
+
+/// A move whose server outcome is unknown because the connection failed.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct PendingMove {
+    index: usize,
+    action: &'static str,
+    was_flagged: bool,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum Retry {
+    /// Reload the board, then resend `pending` only if the server did not apply it.
+    Resync {
+        id: String,
+        pending: Option<PendingMove>,
+    },
+    Start {
+        mode: String,
+    },
+    Submit {
+        id: String,
+    },
+}
+
+struct ConnectionLost {
+    retry: Retry,
+    attempt: u32,
+    timer: Timer,
+    error: String,
+}
+
+/// The popup is shown from the second consecutive failure so short blips stay quiet.
+const POPUP_AFTER_ATTEMPTS: u32 = 2;
+
+fn retry_delay(attempt: u32) -> f32 {
+    [1.0, 2.0, 4.0, 8.0, 15.0][(attempt as usize).saturating_sub(1).min(4)]
 }
 
 const LEADERBOARD_SIZE: usize = 10;
@@ -78,6 +124,9 @@ impl Default for Game {
             board_scroll: Vec2::ZERO,
             last_move: None,
             game_over: None,
+            connection: None,
+            tile_images: None,
+            banner: Handle::default(),
         }
     }
 }
@@ -126,19 +175,32 @@ enum Action {
     Help,
     CloseHelp,
     CloseGameOver,
+    RetryNow,
+    StopRetrying,
     Zoom,
 }
 
+#[derive(Component)]
+struct RetryText;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "Minesweeper".into(),
-            resolution: (1200, 950).into(),
-            ..default()
-        }),
-        ..default()
-    }))
+    app.add_plugins(
+        DefaultPlugins
+            .set(AssetPlugin {
+                file_path: env!("CARGO_MANIFEST_DIR").into(),
+                ..default()
+            })
+            .set(ImagePlugin::default_nearest())
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "Minesweeper".into(),
+                    resolution: (1200, 950).into(),
+                    ..default()
+                }),
+                ..default()
+            }),
+    )
     .insert_resource(ClearColor(Color::srgb(0.07, 0.09, 0.13)))
     .init_resource::<Game>()
     .add_systems(Startup, setup)
@@ -151,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tiles,
             update_flashes,
             poll_online,
+            retry_connection,
             update_status,
             scroll_board,
         )
@@ -178,14 +241,32 @@ fn windows_ui_font() -> Result<Font, Box<dyn std::error::Error>> {
         .map_err(|error| format!("Cannot load UI font {}: {error}", path.display()).into())
 }
 
-fn setup(mut commands: Commands, mut game: ResMut<Game>) {
+fn setup(mut commands: Commands, mut game: ResMut<Game>, asset_server: Res<AssetServer>) {
     commands.spawn(Camera2d);
+    game.banner = asset_server.load("gfx/Makibishi Sweeper.png");
+    game.tile_images = Some(TileImages {
+        covered: std::array::from_fn(|variant| {
+            asset_server.load(format!("gfx/tile-{variant}.png"))
+        }),
+        flagged: asset_server.load("gfx/sashimono.png"),
+        mine: asset_server.load("gfx/makibishi.png"),
+    });
     game.online.dispatch(Operation::Restore);
     build_screen(&mut commands, &game);
 }
 
 fn label(text: impl Into<String>, size: f32) -> impl Bundle {
     colored_label(text, size, Color::WHITE)
+}
+
+fn tile_variant(row: u32, col: u32) -> usize {
+    let mut x = row.wrapping_mul(0x9E3779B9) ^ col.wrapping_mul(0x85EBCA6B);
+
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB352D);
+    x ^= x >> 15;
+
+    (x % 4) as usize
 }
 
 fn colored_label(text: impl Into<String>, size: f32, color: Color) -> impl Bundle {
@@ -347,6 +428,76 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                     });
             });
     }
+    if let Some(lost) = game
+        .connection
+        .as_ref()
+        .filter(|lost| lost.attempt >= POPUP_AFTER_ATTEMPTS && !game.quit_confirmation)
+    {
+        commands
+            .spawn((
+                Screen,
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: percent(100),
+                    height: percent(100),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.07, 0.09, 0.13, 0.96)),
+                GlobalZIndex(25),
+            ))
+            .with_children(|parent| {
+                parent
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(12),
+                            padding: UiRect::all(px(24)),
+                            max_width: px(760),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.12, 0.17, 0.23)),
+                    ))
+                    .with_children(|parent| {
+                        parent.spawn(colored_label(
+                            "Connection problem",
+                            28.0,
+                            Color::srgb(1.0, 0.6, 0.3),
+                        ));
+                        parent.spawn(label(&lost.error, 16.0));
+                        let (detail, stop) = match &lost.retry {
+                            Retry::Resync { .. } => (
+                                if game.board.started {
+                                    "The board is hidden until it is back in sync. The ranked clock keeps running on the server."
+                                } else {
+                                    "The board is hidden until it is back in sync."
+                                },
+                                "Stop and play offline (Esc)",
+                            ),
+                            Retry::Start { .. } => (
+                                "Could not start a ranked game.",
+                                "Stop and play offline (Esc)",
+                            ),
+                            Retry::Submit { .. } => (
+                                "Your winning time has not been saved yet.",
+                                "Stop retrying (Esc)",
+                            ),
+                        };
+                        parent.spawn(label(detail, 18.0));
+                        parent.spawn((label(retry_text(lost, &game.online), 18.0), RetryText));
+                        parent
+                            .spawn(Node {
+                                column_gap: px(12),
+                                ..default()
+                            })
+                            .with_children(|parent| {
+                                button(parent, "Retry now (Enter)", Action::RetryNow);
+                                button(parent, stop, Action::StopRetrying);
+                            });
+                    });
+            });
+    }
     if game.quit_confirmation {
         commands
             .spawn((
@@ -402,7 +553,16 @@ fn build_screen(commands: &mut Commands, game: &Game) {
             },
         ))
         .with_children(|parent| {
-            parent.spawn(label("Minesweeper", 32.0));
+            parent.spawn((
+                ImageNode::new(game.banner.clone()),
+                Node {
+                    width: percent(100),
+                    max_width: px(1269),
+                    aspect_ratio: Some(1269.0 / 249.0),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+            ));
             let account = game.online.session.as_ref().map_or(
                 "Playing anonymously. Sign in for online ranked games.".to_string(),
                 |session| format!("Signed in as {}", session.display_name),
@@ -603,7 +763,22 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                             for (index, cell) in game.board.cells.iter().enumerate() {
                                 let show_mine = cell.mine
                                     && (cell.revealed || game.board.status == Status::Lost);
-                                let text = if show_mine {
+                                let image = game.tile_images.as_ref().and_then(|images| {
+                                    if show_mine {
+                                        Some(images.mine.clone())
+                                    } else if cell.flagged {
+                                        Some(images.flagged.clone())
+                                    } else if !cell.revealed {
+                                        let row = (index / game.board.columns) as u32;
+                                        let col = (index % game.board.columns) as u32;
+                                        Some(images.covered[tile_variant(row, col)].clone())
+                                    } else {
+                                        None
+                                    }
+                                });
+                                let text = if image.is_some() {
+                                    String::new()
+                                } else if show_mine {
                                     "*".into()
                                 } else if cell.flagged {
                                     "F".into()
@@ -621,27 +796,32 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                                 } else {
                                     Color::srgb(0.26, 0.34, 0.43)
                                 };
-                                parent
-                                    .spawn((
-                                        Button,
-                                        Tile(index),
-                                        Node {
-                                            width: px(tile_size),
-                                            height: px(tile_size),
-                                            align_items: AlignItems::Center,
-                                            justify_content: JustifyContent::Center,
-                                            ..default()
-                                        },
-                                        BackgroundColor(color),
-                                    ))
-                                    .with_children(|parent| {
-                                        let text_color = if cell.revealed && !show_mine {
-                                            number_color(cell.count)
-                                        } else {
-                                            Color::WHITE
-                                        };
-                                        parent.spawn(colored_label(text, 20.0 * scale, text_color));
+                                let mut tile = parent.spawn((
+                                    Button,
+                                    Tile(index),
+                                    Node {
+                                        width: px(tile_size),
+                                        height: px(tile_size),
+                                        align_items: AlignItems::Center,
+                                        justify_content: JustifyContent::Center,
+                                        ..default()
+                                    },
+                                    BackgroundColor(color),
+                                ));
+                                if let Some(image) = image {
+                                    tile.insert(ImageNode {
+                                        image_mode: NodeImageMode::Stretch,
+                                        ..ImageNode::new(image)
                                     });
+                                }
+                                tile.with_children(|parent| {
+                                    let text_color = if cell.revealed && !show_mine {
+                                        number_color(cell.count)
+                                    } else {
+                                        Color::WHITE
+                                    };
+                                    parent.spawn(colored_label(text, 20.0 * scale, text_color));
+                                });
                             }
                         });
                 });
@@ -665,6 +845,7 @@ fn scroll_board(
         if game.help_open
             || game.quit_confirmation
             || game.game_over.is_some()
+            || game.connection.is_some()
             || game.online.login_open
             || game.online.show_scores
         {
@@ -710,6 +891,7 @@ fn new_board(game: &mut Game) {
     game.online.game_id = None;
     game.online.submitted = false;
     game.online.needs_refresh = false;
+    game.connection = None;
     if game.online.ranked && !game.custom {
         let mode = match (rows, columns) {
             (16, 16) => "intermediate",
@@ -756,6 +938,20 @@ fn keyboard(
             commands.queue(|world: &mut World| {
                 world.write_message(bevy::app::AppExit::Success);
             });
+        }
+        return;
+    }
+    if game
+        .connection
+        .as_ref()
+        .is_some_and(|lost| lost.attempt >= POPUP_AFTER_ATTEMPTS)
+    {
+        if keys.just_pressed(KeyCode::Enter) && !game.online.busy() {
+            dispatch_retry(&mut game);
+            rebuild(&mut commands, &screen, &game);
+        } else if keys.just_pressed(KeyCode::Escape) && !game.online.busy() {
+            stop_retrying(&mut game);
+            rebuild(&mut commands, &screen, &game);
         }
         return;
     }
@@ -829,6 +1025,9 @@ fn controls(
         if game.game_over.is_some() && !matches!(action, Action::CloseGameOver) {
             continue;
         }
+        if game.connection.is_some() && !matches!(action, Action::RetryNow | Action::StopRetrying) {
+            continue;
+        }
         if game.online.busy()
             && !matches!(
                 action,
@@ -850,6 +1049,8 @@ fn controls(
             Action::Help => game.help_open = !game.help_open,
             Action::CloseHelp => game.help_open = false,
             Action::CloseGameOver => game.game_over = None,
+            Action::RetryNow => dispatch_retry(&mut game),
+            Action::StopRetrying => stop_retrying(&mut game),
             Action::Zoom => {
                 game.zoomed = !game.zoomed;
                 game.board_scroll = Vec2::ZERO;
@@ -946,6 +1147,8 @@ fn tiles(
     if game.board.status != Status::Playing
         || game.help_open
         || game.quit_confirmation
+        || game.game_over.is_some()
+        || game.connection.is_some()
         || game.online.login_open
         || game.online.show_scores
         || (game.online.ranked
@@ -1116,6 +1319,133 @@ fn request_placement(game: &mut Game) {
     }
 }
 
+fn retry_text(lost: &ConnectionLost, online: &Online) -> String {
+    if online.busy() {
+        format!("Retrying now (attempt {})...", lost.attempt + 1)
+    } else {
+        format!(
+            "Attempt {} failed. Retrying in {}s.",
+            lost.attempt,
+            lost.timer.remaining_secs().ceil() as u32
+        )
+    }
+}
+
+/// Schedules a retry for a failed game request. Returns false when it cannot be retried.
+fn connection_failed(game: &mut Game, operation: Option<Operation>, error: &str) -> bool {
+    let previous = game.connection.take();
+    let retry = match operation {
+        Some(Operation::Move {
+            id,
+            action,
+            row,
+            column,
+        }) => {
+            let index = row * game.board.columns + column;
+            Retry::Resync {
+                id,
+                pending: Some(PendingMove {
+                    index,
+                    action,
+                    was_flagged: game.board.cells.get(index).is_some_and(|c| c.flagged),
+                }),
+            }
+        }
+        Some(Operation::Refresh { id }) => {
+            let pending = match previous.as_ref().map(|lost| &lost.retry) {
+                Some(Retry::Resync {
+                    id: previous_id,
+                    pending,
+                }) if *previous_id == id => *pending,
+                _ => None,
+            };
+            Retry::Resync { id, pending }
+        }
+        Some(Operation::Start { mode }) => Retry::Start { mode },
+        Some(Operation::Submit { id }) => Retry::Submit { id },
+        _ => return false,
+    };
+    let attempt = previous.map_or(0, |lost| lost.attempt) + 1;
+    let delay = retry_delay(attempt);
+    game.online.message = format!("Connection problem; retrying in {delay:.0}s.");
+    game.connection = Some(ConnectionLost {
+        retry,
+        attempt,
+        timer: Timer::from_seconds(delay, TimerMode::Once),
+        error: error.into(),
+    });
+    true
+}
+
+fn dispatch_retry(game: &mut Game) {
+    let Some(lost) = &mut game.connection else {
+        return;
+    };
+    lost.timer.reset();
+    let operation = match lost.retry.clone() {
+        Retry::Resync { id, .. } => Operation::Refresh { id },
+        Retry::Start { mode } => Operation::Start { mode },
+        Retry::Submit { id } => Operation::Submit { id },
+    };
+    game.online.dispatch(operation);
+}
+
+fn stop_retrying(game: &mut Game) {
+    if game.online.busy() {
+        return;
+    }
+    let Some(lost) = game.connection.take() else {
+        return;
+    };
+    if let Retry::Submit { .. } = lost.retry {
+        if let Some(over) = &mut game.game_over
+            && over.recording == Recording::Pending
+        {
+            over.recording = Recording::Failed(lost.error);
+        }
+        game.online.message = "Score not saved. Use Submit score to try again.".into();
+    } else {
+        game.online.ranked = false;
+        new_board(game);
+        game.online.message =
+            "Stopped retrying; the ranked game was abandoned. Playing offline.".into();
+    }
+}
+
+fn move_applied(board: &Board, pending: PendingMove) -> bool {
+    let cell = board.cells[pending.index];
+    match pending.action {
+        "flag" => cell.flagged != pending.was_flagged,
+        "reveal" => cell.revealed,
+        // Chording twice is harmless, so it is always resent.
+        _ => false,
+    }
+}
+
+fn retry_connection(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut game: ResMut<Game>,
+    screen: Query<Entity, With<Screen>>,
+    mut text: Query<&mut Text, With<RetryText>>,
+) {
+    if game.online.busy() {
+        return;
+    }
+    let Some(lost) = &mut game.connection else {
+        return;
+    };
+    lost.timer.tick(time.delta());
+    if lost.timer.is_finished() {
+        dispatch_retry(&mut game);
+        rebuild(&mut commands, &screen, &game);
+    } else if let Some(lost) = &game.connection {
+        for mut text in &mut text {
+            **text = retry_text(lost, &game.online);
+        }
+    }
+}
+
 fn recording_text(over: &GameOver, online: &Online) -> String {
     match &over.recording {
         Recording::Lost => "Score not recorded: only cleared boards are scored.".into(),
@@ -1214,6 +1544,7 @@ fn login_input(
             || game.help_open
             || game.quit_confirmation
             || game.game_over.is_some()
+            || game.connection.is_some()
             || game.online.busy()
             || event.state != ButtonState::Pressed
         {
@@ -1276,6 +1607,14 @@ fn poll_online(
 fn handle_online_reply(game: &mut Game, result: Result<Reply, online::ApiError>) {
     match result {
         Err(error) => {
+            let operation = game.online.last_game_operation.take();
+            if error.retryable
+                && !error.unauthorized
+                && connection_failed(game, operation, &error.message)
+            {
+                return;
+            }
+            game.connection = None;
             if let Some(over) = &mut game.game_over {
                 if over.recording == Recording::Pending {
                     over.recording = Recording::Failed(error.message.clone());
@@ -1338,6 +1677,7 @@ fn handle_online_reply(game: &mut Game, result: Result<Reply, online::ApiError>)
                 Reply::Board(view) => {
                     let elapsed_ms = view.elapsed_ms;
                     let was_playing = game.board.status == Status::Playing;
+                    let recovered = game.connection.take();
                     match view.into_board() {
                         Ok((id, board, elapsed)) => {
                             game.online.game_id = Some(id.clone());
@@ -1349,6 +1689,20 @@ fn handle_online_reply(game: &mut Game, result: Result<Reply, online::ApiError>)
                             if game.board.status == Status::Won && !game.online.submitted {
                                 game.online.dispatch(Operation::Submit { id });
                             }
+                            if let Some(lost) = recovered {
+                                game.online.message = "Reconnected; board back in sync.".into();
+                                if let Retry::Resync {
+                                    pending: Some(pending),
+                                    ..
+                                } = lost.retry
+                                    && game.board.status == Status::Playing
+                                    && !move_applied(&game.board, pending)
+                                {
+                                    apply_move(game, pending.index, pending.action);
+                                    game.online.message =
+                                        "Reconnected; resending your last move.".into();
+                                }
+                            }
                             if was_playing && game.board.status != Status::Playing {
                                 let elapsed_ms = elapsed_ms
                                     .unwrap_or_else(|| (game.elapsed * 1000.0).round() as u64);
@@ -1359,6 +1713,7 @@ fn handle_online_reply(game: &mut Game, result: Result<Reply, online::ApiError>)
                     }
                 }
                 Reply::Submitted => {
+                    game.connection = None;
                     game.online.submitted = true;
                     game.online.message = "Online score saved.".into();
                     if let Some(over) = &mut game.game_over
@@ -1375,15 +1730,26 @@ fn handle_online_reply(game: &mut Game, result: Result<Reply, online::ApiError>)
 fn update_flashes(
     mut commands: Commands,
     time: Res<Time>,
-    mut tiles: Query<(Entity, &mut BackgroundColor, &mut TileFlash)>,
+    mut tiles: Query<(
+        Entity,
+        &mut BackgroundColor,
+        Option<&mut ImageNode>,
+        &mut TileFlash,
+    )>,
 ) {
-    for (entity, mut background, mut flash) in &mut tiles {
+    for (entity, mut background, image, mut flash) in &mut tiles {
         flash.timer.tick(time.delta());
         if flash.timer.is_finished() {
             background.0 = flash.original;
+            if let Some(mut image) = image {
+                image.color = Color::WHITE;
+            }
             commands.entity(entity).remove::<TileFlash>();
         } else {
             background.0 = Color::srgb(0.55, 0.65, 0.75);
+            if let Some(mut image) = image {
+                image.color = Color::srgb(1.0, 0.7, 0.7);
+            }
         }
     }
 }
@@ -1626,6 +1992,7 @@ mod tests {
             Err(online::ApiError {
                 message: "Session expired.".into(),
                 unauthorized: true,
+                retryable: false,
             }),
         );
         assert!(!game.online.ranked);
@@ -1732,6 +2099,7 @@ mod tests {
             Err(online::ApiError {
                 message: "Invalid username or password.".into(),
                 unauthorized: true,
+                retryable: false,
             }),
         );
         assert!(game.board.cells[0].flagged);
@@ -1803,6 +2171,120 @@ mod tests {
             for other in count + 1..=8 {
                 assert_ne!(number_color(count), number_color(other));
             }
+        }
+    }
+
+    #[test]
+    fn banner_replaces_title_and_preserves_its_aspect_ratio() {
+        let mut assets = Assets::<Image>::default();
+        let game = Game {
+            banner: assets.add(Image::default()),
+            ..default()
+        };
+        let mut app = App::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+        queue.apply(app.world_mut());
+
+        let mut query = app.world_mut().query::<(&ImageNode, &Node)>();
+        let (image, node) = query.single(app.world()).unwrap();
+        assert_eq!(image.image, game.banner);
+        assert_eq!(node.width, percent(100));
+        assert_eq!(node.max_width, px(1269));
+        assert_eq!(node.aspect_ratio, Some(1269.0 / 249.0));
+        assert_eq!(node.flex_shrink, 0.0);
+        assert!(
+            !app.world_mut()
+                .query::<&Text>()
+                .iter(app.world())
+                .any(|text| text.0 == "Minesweeper")
+        );
+    }
+
+    #[test]
+    fn tile_images_cover_hidden_flagged_and_mine_states_only() {
+        let mut game = Game {
+            board: Board::new(1, 4, 1),
+            ..default()
+        };
+        game.board.status = Status::Lost;
+        game.board.cells[1].flagged = true;
+        game.board.cells[2].mine = true;
+        game.board.cells[2].revealed = true;
+        game.board.cells[3].revealed = true;
+        game.board.cells[3].count = 1;
+        game.tile_images = Some(TileImages {
+            covered: std::array::from_fn(|_| Handle::default()),
+            flagged: Handle::default(),
+            mine: Handle::default(),
+        });
+
+        let mut app = App::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+        queue.apply(app.world_mut());
+
+        let mut query = app.world_mut().query::<(&Tile, Option<&ImageNode>)>();
+        let images: Vec<_> = query
+            .iter(app.world())
+            .filter_map(|(tile, image)| {
+                image.map(|image| {
+                    assert_eq!(image.image_mode, NodeImageMode::Stretch);
+                    tile.0
+                })
+            })
+            .collect();
+        assert_eq!(images, [0, 1, 2]);
+    }
+
+    #[test]
+    fn tile_variants_match_the_fixed_coordinate_hash() {
+        for (row, col, expected) in [
+            (0, 0, 0),
+            (0, 1, 0),
+            (0, 2, 3),
+            (0, 3, 2),
+            (1, 0, 2),
+            (1, 1, 2),
+            (2, 3, 3),
+            (u32::MAX, u32::MAX, 2),
+        ] {
+            assert_eq!(tile_variant(row, col), expected);
+        }
+        let variants: std::collections::HashSet<_> = (0..9)
+            .flat_map(|row| (0..9).map(move |col| tile_variant(row, col)))
+            .collect();
+        assert_eq!(variants.len(), 4);
+    }
+
+    #[test]
+    fn covered_tiles_use_coordinate_variants_at_both_zoom_levels() {
+        let mut assets = Assets::<Image>::default();
+        let mut game = Game::default();
+        game.tile_images = Some(TileImages {
+            covered: std::array::from_fn(|_| assets.add(Image::default())),
+            flagged: assets.add(Image::default()),
+            mine: assets.add(Image::default()),
+        });
+        for zoomed in [false, true] {
+            game.zoomed = zoomed;
+            let mut app = App::new();
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+            queue.apply(app.world_mut());
+
+            let mut query = app.world_mut().query::<(&Tile, &ImageNode)>();
+            let mut count = 0;
+            for (tile, image) in query.iter(app.world()) {
+                let row = (tile.0 / game.board.columns) as u32;
+                let col = (tile.0 % game.board.columns) as u32;
+                assert_eq!(
+                    image.image,
+                    game.tile_images.as_ref().unwrap().covered[tile_variant(row, col)]
+                );
+                count += 1;
+            }
+            assert_eq!(count, game.board.cells.len());
         }
     }
 
@@ -2272,5 +2754,187 @@ mod tests {
             "Leaderboard: #2 on Beginner."
         );
         assert_eq!(worker.join().unwrap().len(), 2);
+    }
+
+    const GAME_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+    fn board_json(flag_first: bool) -> serde_json::Value {
+        let cells: Vec<_> = (0..81)
+            .map(|index| {
+                serde_json::json!({
+                    "mine": false, "revealed": false,
+                    "flagged": flag_first && index == 0, "count": 0
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "id": GAME_ID, "mode": "easy", "rows": 9, "columns": 9, "mine_count": 10,
+            "cells": cells, "status": "playing", "elapsed_ms": 1000, "clock_started": true
+        })
+    }
+
+    fn ranked_game(online: Online) -> Game {
+        let mut game = Game {
+            online,
+            ..default()
+        };
+        game.online.ranked = true;
+        game.online.session = Some(online::Session {
+            token: "token".into(),
+            display_name: "Bjørn".into(),
+        });
+        game.online.game_id = Some(GAME_ID.into());
+        game.board.started = true;
+        game
+    }
+
+    fn wait_reply(game: &mut Game) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            if let Some(result) = game.online.poll() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        handle_online_reply(game, result);
+    }
+
+    #[test]
+    fn failed_move_resyncs_then_resends_the_missing_move() {
+        let (online, worker) = online::tests::scripted_online(vec![
+            (503, serde_json::json!("Service unavailable")),
+            (200, board_json(false)),
+            (200, board_json(true)),
+        ]);
+        let mut game = ranked_game(online);
+        apply_move(&mut game, 0, "flag");
+        wait_reply(&mut game);
+        let lost = game.connection.as_ref().unwrap();
+        assert_eq!(lost.attempt, 1);
+        assert_eq!(
+            lost.retry,
+            Retry::Resync {
+                id: GAME_ID.into(),
+                pending: Some(PendingMove {
+                    index: 0,
+                    action: "flag",
+                    was_flagged: false
+                })
+            }
+        );
+        assert!(game.online.needs_refresh);
+        dispatch_retry(&mut game);
+        wait_reply(&mut game);
+        assert!(game.connection.is_none());
+        assert!(game.online.busy(), "the unapplied move must be resent");
+        wait_reply(&mut game);
+        assert!(game.board.cells[0].flagged);
+        assert!(!game.online.needs_refresh);
+        let requests = worker.join().unwrap();
+        assert!(requests[0].starts_with("POST") && requests[0].contains("/move"));
+        assert!(requests[1].starts_with("GET"));
+        assert!(requests[2].starts_with("POST") && requests[2].contains("/move"));
+    }
+
+    #[test]
+    fn applied_move_is_not_resent_after_resync() {
+        let mut game = ranked_game(Online::default());
+        game.connection = Some(ConnectionLost {
+            retry: Retry::Resync {
+                id: GAME_ID.into(),
+                pending: Some(PendingMove {
+                    index: 0,
+                    action: "flag",
+                    was_flagged: false,
+                }),
+            },
+            attempt: 3,
+            timer: Timer::from_seconds(1.0, TimerMode::Once),
+            error: "down".into(),
+        });
+        let view: online::GameView = serde_json::from_value(board_json(true)).unwrap();
+        handle_online_reply(&mut game, Ok(Reply::Board(view)));
+        assert!(game.connection.is_none());
+        assert!(!game.online.busy());
+        assert!(game.online.message.contains("back in sync"));
+    }
+
+    #[test]
+    fn repeated_failures_back_off_and_show_popup() {
+        let mut game = ranked_game(Online::default());
+        let error = || online::ApiError {
+            message: "Cannot reach the server".into(),
+            unauthorized: false,
+            retryable: true,
+        };
+        game.online.last_game_operation = Some(Operation::Refresh { id: GAME_ID.into() });
+        handle_online_reply(&mut game, Err(error()));
+        assert_eq!(game.connection.as_ref().unwrap().attempt, 1);
+        game.online.last_game_operation = Some(Operation::Refresh { id: GAME_ID.into() });
+        handle_online_reply(&mut game, Err(error()));
+        let lost = game.connection.as_ref().unwrap();
+        assert_eq!(lost.attempt, 2);
+        assert_eq!(lost.timer.duration().as_secs_f32(), 2.0);
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mut world = World::new();
+        build_screen(&mut Commands::new(&mut queue, &world), &game);
+        queue.apply(&mut world);
+        assert_eq!(world.query::<&RetryText>().iter(&world).count(), 1);
+        assert_eq!(retry_delay(99), 15.0);
+    }
+
+    #[test]
+    fn escape_on_connection_popup_abandons_ranked_game() {
+        let mut app = shortcut_app(true, Status::Playing);
+        {
+            let mut game = app.world_mut().resource_mut::<Game>();
+            game.online.ranked = true;
+            game.online.game_id = Some(GAME_ID.into());
+            game.online.needs_refresh = true;
+            game.connection = Some(ConnectionLost {
+                retry: Retry::Resync {
+                    id: GAME_ID.into(),
+                    pending: None,
+                },
+                attempt: 2,
+                timer: Timer::from_seconds(2.0, TimerMode::Once),
+                error: "down".into(),
+            });
+        }
+        press_shortcut(&mut app, &[KeyCode::F1]);
+        assert!(!app.world().resource::<Game>().help_open);
+        press_shortcut(&mut app, &[KeyCode::Escape]);
+        let game = app.world().resource::<Game>();
+        assert!(game.connection.is_none());
+        assert!(!game.online.ranked);
+        assert!(game.online.game_id.is_none());
+        assert!(!game.online.needs_refresh);
+        assert!(!game.board.started);
+    }
+
+    #[test]
+    fn submit_retry_keeps_score_pending_until_player_stops() {
+        let mut game = ranked_game(Online::default());
+        game.game_over = Some(won_over(5000, Recording::Pending));
+        game.online.last_game_operation = Some(Operation::Submit { id: GAME_ID.into() });
+        handle_online_reply(
+            &mut game,
+            Err(online::ApiError {
+                message: "Server error 502".into(),
+                unauthorized: false,
+                retryable: true,
+            }),
+        );
+        assert_eq!(
+            game.game_over.as_ref().unwrap().recording,
+            Recording::Pending
+        );
+        stop_retrying(&mut game);
+        assert!(game.online.ranked);
+        assert_eq!(
+            game.game_over.as_ref().unwrap().recording,
+            Recording::Failed("Server error 502".into())
+        );
     }
 }
