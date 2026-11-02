@@ -1,4 +1,5 @@
 mod board;
+mod custom;
 mod online;
 
 use bevy::input::{
@@ -21,16 +22,101 @@ struct Game {
     custom_rows: usize,
     custom_columns: usize,
     custom_mines: usize,
+    custom_dialog: Option<custom::Settings>,
+    settings_path: Option<std::path::PathBuf>,
+    settings_error: Option<String>,
     online: Online,
     quit_confirmation: bool,
     help_open: bool,
     zoomed: bool,
     board_scroll: Vec2,
     last_move: Option<(usize, &'static str)>,
+    triggered_mine: Option<usize>,
     game_over: Option<GameOver>,
     connection: Option<ConnectionLost>,
     tile_images: Option<TileImages>,
     banner: Handle<Image>,
+    chevron: Handle<Image>,
+    ruru: Ruru,
+    ruru_font: Handle<Font>,
+    loss_image: Handle<Image>,
+    win_image: Handle<Image>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Resource)]
+struct AppIcon(winit::window::Icon);
+
+#[cfg(target_os = "windows")]
+fn app_icon() -> Result<winit::window::Icon, Box<dyn std::error::Error>> {
+    let image =
+        image::load_from_memory(include_bytes!("..\\gfx\\makibishi-icon.png"))?.into_rgba8();
+    let (width, height) = image.dimensions();
+    Ok(winit::window::Icon::from_rgba(
+        image.into_raw(),
+        width,
+        height,
+    )?)
+}
+
+#[cfg(target_os = "windows")]
+fn set_window_icon(
+    mut created: MessageReader<bevy::window::WindowCreated>,
+    icon: Res<AppIcon>,
+    _main_thread: bevy::ecs::system::NonSendMarker,
+) {
+    bevy::winit::WINIT_WINDOWS.with_borrow(|windows| {
+        for event in created.read() {
+            if let Some(window) = windows.get_window(event.window) {
+                window.set_window_icon(Some(icon.0.clone()));
+            } else {
+                eprintln!("Cannot set app icon: newly created window is unavailable");
+            }
+        }
+    });
+}
+
+const FOOTER_HEIGHT: f32 = 80.0;
+const MENU_HEIGHT: f32 = 72.0;
+const RURU_WIDTH: f32 = 68.0;
+const RURU_HEIGHT: f32 = 72.0;
+const RURU_TRAVEL_SECONDS: f64 = 3.0;
+const RURU_FADE_SECONDS: f64 = 2.0;
+
+#[derive(Default)]
+struct Ruru {
+    clock: f64,
+    mine_hits: std::collections::VecDeque<f64>,
+    animation_started: Option<f64>,
+}
+
+impl Ruru {
+    fn record_mine_hit(&mut self) {
+        while self
+            .mine_hits
+            .front()
+            .is_some_and(|hit| self.clock - hit > 60.0)
+        {
+            self.mine_hits.pop_front();
+        }
+        self.mine_hits.push_back(self.clock);
+        if self.mine_hits.len() == 5 {
+            self.mine_hits.clear();
+            self.animation_started = Some(self.clock);
+        }
+    }
+
+    fn frame(&self, screen_width: f32) -> Option<(f32, f32)> {
+        let elapsed = self.clock - self.animation_started?;
+        if elapsed >= RURU_TRAVEL_SECONDS + RURU_FADE_SECONDS {
+            return None;
+        }
+        let progress = (elapsed / RURU_TRAVEL_SECONDS).min(1.0) as f32;
+        let center = (screen_width - RURU_WIDTH) / 2.0;
+        let left = -RURU_WIDTH + (center + RURU_WIDTH) * progress;
+        let alpha = 1.0 - ((elapsed - RURU_TRAVEL_SECONDS) / RURU_FADE_SECONDS).max(0.0) as f32;
+        Some((left, alpha))
+    }
 }
 
 struct TileImages {
@@ -117,16 +203,25 @@ impl Default for Game {
             custom_rows: 10,
             custom_columns: 10,
             custom_mines: 15,
+            custom_dialog: None,
+            settings_path: None,
+            settings_error: None,
             online: Online::default(),
             quit_confirmation: false,
             help_open: false,
             zoomed: false,
             board_scroll: Vec2::ZERO,
             last_move: None,
+            triggered_mine: None,
             game_over: None,
             connection: None,
             tile_images: None,
             banner: Handle::default(),
+            chevron: Handle::default(),
+            ruru: Ruru::default(),
+            ruru_font: Handle::default(),
+            loss_image: Handle::default(),
+            win_image: Handle::default(),
         }
     }
 }
@@ -145,13 +240,45 @@ struct StatusText;
 #[derive(Component)]
 struct NetworkStatusSlot;
 #[derive(Component)]
+struct GameControls;
+#[derive(Component)]
+struct RuruOverlay;
+#[derive(Component)]
+struct RuruSprite;
+#[derive(Component)]
+struct GameMessage;
+#[derive(Component)]
+struct LossOverlay;
+#[derive(Component)]
+struct TriggeredMineHighlight;
+#[derive(Component)]
+struct WinOverlay;
+#[derive(Component)]
+struct WinningScore;
+#[derive(Component)]
+struct LoginDialog;
+#[derive(Component)]
 struct BoardViewport;
+#[derive(Component)]
+struct BoardGrid;
+#[derive(Component)]
+struct BoardChevron;
+#[derive(Component, Clone, Copy)]
+enum BoardEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
 #[derive(Component, Clone, Copy)]
 enum Action {
     Beginner,
     Intermediate,
     Advanced,
     Custom,
+    StartCustom,
+    ResetCustom,
+    CloseCustom,
     Rows(i32),
     Columns(i32),
     Mines(i32),
@@ -174,7 +301,6 @@ enum Action {
     CancelQuit,
     Help,
     CloseHelp,
-    CloseGameOver,
     RetryNow,
     StopRetrying,
     Zoom,
@@ -182,6 +308,19 @@ enum Action {
 
 #[derive(Component)]
 struct RetryText;
+
+
+fn play_intro(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+) {
+    commands.spawn((
+        AudioPlayer::new(
+            asset_server.load("sfx/makibishi_intro.ogg")
+        ),
+        PlaybackSettings::DESPAWN,
+    ));
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new();
@@ -194,7 +333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .set(ImagePlugin::default_nearest())
             .set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "Minesweeper".into(),
+                    title: "Makibishi".into(),
                     resolution: (1200, 950).into(),
                     ..default()
                 }),
@@ -203,13 +342,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .insert_resource(ClearColor(Color::srgb(0.07, 0.09, 0.13)))
     .init_resource::<Game>()
+    .add_systems(Startup, play_intro)
     .add_systems(Startup, setup)
+    .add_systems(
+        PostUpdate,
+        update_board_edges.after(bevy::ui::UiSystems::Layout),
+    )
     .add_systems(
         Update,
         (
+            update_ruru,
             login_input,
             keyboard,
             controls,
+            dismiss_game_over_on_click,
             tiles,
             update_flashes,
             poll_online,
@@ -220,21 +366,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .chain(),
     );
     #[cfg(target_os = "windows")]
-    app.world_mut()
-        .resource_mut::<Assets<Font>>()
-        .insert(bevy::asset::AssetId::default(), windows_ui_font()?)?;
+    {
+        app.insert_resource(AppIcon(app_icon()?))
+            .add_systems(Update, set_window_icon);
+        let ui_font = windows_ui_font()?;
+        let japanese_font = windows_font("YuGothR.ttc")?;
+        let mut fonts = app.world_mut().resource_mut::<Assets<Font>>();
+        fonts.insert(bevy::asset::AssetId::default(), ui_font)?;
+        let ruru_font = fonts.add(japanese_font);
+        app.world_mut().resource_mut::<Game>().ruru_font = ruru_font;
+    }
     app.run();
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn windows_ui_font() -> Result<Font, Box<dyn std::error::Error>> {
+    windows_font("segoeui.ttf")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_font(filename: &str) -> Result<Font, Box<dyn std::error::Error>> {
     let path = std::path::PathBuf::from(
         std::env::var_os("WINDIR")
             .ok_or("WINDIR is unavailable; cannot locate the Windows UI font")?,
     )
     .join("Fonts")
-    .join("segoeui.ttf");
+    .join(filename);
     let bytes = std::fs::read(&path)
         .map_err(|error| format!("Cannot read UI font {}: {error}", path.display()))?;
     Font::try_from_bytes(bytes)
@@ -243,16 +401,91 @@ fn windows_ui_font() -> Result<Font, Box<dyn std::error::Error>> {
 
 fn setup(mut commands: Commands, mut game: ResMut<Game>, asset_server: Res<AssetServer>) {
     commands.spawn(Camera2d);
-    game.banner = asset_server.load("gfx/Makibishi Sweeper.png");
+    match custom::path() {
+        Ok(path) => {
+            match custom::load(&path) {
+                Ok(settings) => {
+                    game.custom_rows = settings.rows;
+                    game.custom_columns = settings.columns;
+                    game.custom_mines = settings.mines;
+                }
+                Err(error) => game.settings_error = Some(error),
+            }
+            game.settings_path = Some(path);
+        }
+        Err(error) => game.settings_error = Some(error),
+    }
+    game.banner = asset_server.load("gfx/Makibishi-Title.png");
+    game.chevron = asset_server.load("gfx/chevron.png");
+    game.loss_image = asset_server.load("gfx/MonkOuch.png");
+    game.win_image = asset_server.load("gfx/MonkAtRest.png");
+    spawn_ruru(&mut commands, asset_server.load("gfx/ruru.png"));
     game.tile_images = Some(TileImages {
         covered: std::array::from_fn(|variant| {
             asset_server.load(format!("gfx/tile-{variant}.png"))
         }),
         flagged: asset_server.load("gfx/sashimono.png"),
-        mine: asset_server.load("gfx/makibishi.png"),
+        mine: asset_server.load("gfx/makibishi-white.png"),
     });
     game.online.dispatch(Operation::Restore);
     build_screen(&mut commands, &game);
+}
+
+fn spawn_ruru(commands: &mut Commands, image: Handle<Image>) {
+    commands
+        .spawn((
+            RuruOverlay,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                bottom: px(FOOTER_HEIGHT + MENU_HEIGHT + 4.0),
+                width: percent(100),
+                height: px(RURU_HEIGHT),
+                ..default()
+            },
+            Visibility::Hidden,
+            bevy::ui::FocusPolicy::Pass,
+            GlobalZIndex(30),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                RuruSprite,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(-RURU_WIDTH),
+                    width: px(RURU_WIDTH),
+                    height: px(RURU_HEIGHT),
+                    ..default()
+                },
+                ImageNode::new(image),
+                bevy::ui::FocusPolicy::Pass,
+            ));
+        });
+}
+
+fn update_ruru(
+    time: Res<Time<Real>>,
+    mut game: ResMut<Game>,
+    mut overlays: Query<(&ComputedNode, &mut Visibility), With<RuruOverlay>>,
+    mut sprites: Query<(&mut Node, &mut ImageNode), With<RuruSprite>>,
+) {
+    game.ruru.clock += time.delta_secs_f64();
+    for (computed, mut visibility) in &mut overlays {
+        let frame = game
+            .ruru
+            .frame(computed.size().x * computed.inverse_scale_factor);
+        *visibility = if frame.is_some() {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if let Some((left, alpha)) = frame {
+            for (mut node, mut image) in &mut sprites {
+                node.left = px(left);
+                image.color.set_alpha(alpha);
+            }
+        }
+    }
 }
 
 fn label(text: impl Into<String>, size: f32) -> impl Bundle {
@@ -310,7 +543,380 @@ fn button(parent: &mut ChildSpawnerCommands, text: &str, action: Action) {
         });
 }
 
+fn footer_button(parent: &mut ChildSpawnerCommands, text: &str, action: Action, color: Color) {
+    parent
+        .spawn((
+            Button,
+            action,
+            Node {
+                padding: UiRect::axes(px(6), px(6)),
+                ..default()
+            },
+        ))
+        .with_children(|parent| {
+            parent.spawn(colored_label(text, 14.0, color));
+        });
+}
+
+fn ranked_game(game: &Game) -> bool {
+    !game.custom && game.online.ranked && game.online.game_id.is_some()
+}
+
+fn custom_button(
+    parent: &mut ChildSpawnerCommands,
+    text: &str,
+    action: Action,
+    width: f32,
+    primary: bool,
+) {
+    parent
+        .spawn((
+            Button,
+            action,
+            Node {
+                width: px(width),
+                max_width: percent(100),
+                padding: UiRect::axes(px(12), px(10)),
+                border: UiRect::all(px(1)),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(if primary {
+                Color::srgb(0.92, 0.92, 0.92)
+            } else {
+                Color::BLACK
+            }),
+            BorderColor::all(Color::srgb(0.2, 0.2, 0.2)),
+            BorderRadius::all(px(28)),
+        ))
+        .with_children(|parent| {
+            parent.spawn(colored_label(
+                text,
+                20.0,
+                if primary { Color::BLACK } else { Color::WHITE },
+            ));
+        });
+}
+
+fn build_custom_dialog(commands: &mut Commands, game: &Game, settings: custom::Settings) {
+    commands
+        .spawn((
+            Screen,
+            Node {
+                position_type: PositionType::Absolute,
+                width: percent(100),
+                height: percent(100),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
+            GlobalZIndex(20),
+        ))
+        .with_children(|parent| {
+            parent
+                .spawn((
+                    Node {
+                        width: px(560),
+                        max_width: percent(95),
+                        max_height: percent(95),
+                        overflow: Overflow::scroll_y(),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(16),
+                        padding: UiRect::all(px(24)),
+                        border: UiRect::all(px(1)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::BLACK),
+                    BorderColor::all(Color::srgb(0.2, 0.2, 0.2)),
+                    BorderRadius::all(px(24)),
+                ))
+                .with_children(|parent| {
+                    parent
+                        .spawn(Node {
+                            justify_content: JustifyContent::SpaceBetween,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        })
+                        .with_children(|parent| {
+                            parent.spawn(label("Custom game", 26.0));
+                            footer_button(parent, "X", Action::CloseCustom, Color::WHITE);
+                        });
+                    for (title, value, minus, plus) in [
+                        ("Rows", settings.rows, Action::Rows(-1), Action::Rows(1)),
+                        (
+                            "Columns",
+                            settings.columns,
+                            Action::Columns(-1),
+                            Action::Columns(1),
+                        ),
+                        (
+                            "Makibishi",
+                            settings.mines,
+                            Action::Mines(-1),
+                            Action::Mines(1),
+                        ),
+                    ] {
+                        parent
+                            .spawn(Node {
+                                align_items: AlignItems::Center,
+                                column_gap: px(16),
+                                ..default()
+                            })
+                            .with_children(|parent| {
+                                parent.spawn((
+                                    label(title, 22.0),
+                                    Node {
+                                        flex_grow: 1.0,
+                                        ..default()
+                                    },
+                                ));
+                                custom_button(parent, "-", minus, 76.0, false);
+                                parent.spawn((
+                                    label(value.to_string(), 22.0),
+                                    Node {
+                                        width: px(48),
+                                        ..default()
+                                    },
+                                ));
+                                custom_button(parent, "+", plus, 76.0, false);
+                            });
+                    }
+                    parent.spawn(label(
+                        format!(
+                            "{} x {} fields - {} makibishi",
+                            settings.rows, settings.columns, settings.mines
+                        ),
+                        18.0,
+                    ));
+                    if let Some(error) = &game.settings_error {
+                        parent.spawn(colored_label(error, 16.0, number_color(3)));
+                    }
+                    parent
+                        .spawn(Node {
+                            justify_content: JustifyContent::End,
+                            column_gap: px(16),
+                            ..default()
+                        })
+                        .with_children(|parent| {
+                            custom_button(parent, "Reset", Action::ResetCustom, 104.0, false);
+                            custom_button(parent, "Start", Action::StartCustom, 216.0, true);
+                        });
+                });
+        });
+}
+
+fn login_ready(online: &Online) -> bool {
+    !online.busy() && !online.username.trim().is_empty() && !online.password.is_empty()
+}
+
+fn build_login_dialog(commands: &mut Commands, game: &Game) {
+    let online = &game.online;
+    let muted = Color::srgb(0.7, 0.7, 0.7);
+    commands
+        .spawn((
+            Screen,
+            LoginDialog,
+            Node {
+                position_type: PositionType::Absolute,
+                width: percent(100),
+                height: percent(100),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
+            GlobalZIndex(20),
+        ))
+        .with_children(|parent| {
+            parent
+                .spawn((
+                    Node {
+                        width: px(640),
+                        max_width: percent(95),
+                        max_height: percent(95),
+                        overflow: Overflow::scroll_y(),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(20),
+                        padding: UiRect::all(px(24)),
+                        border: UiRect::all(px(1)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::BLACK),
+                    BorderColor::all(Color::srgb(0.2, 0.2, 0.2)),
+                    BorderRadius::all(px(24)),
+                ))
+                .with_children(|parent| {
+                    parent
+                        .spawn(Node {
+                            justify_content: JustifyContent::SpaceBetween,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        })
+                        .with_children(|parent| {
+                            parent.spawn(label("Sign in", 26.0));
+                            footer_button(parent, "X", Action::CancelLogin, Color::WHITE);
+                        });
+                    parent.spawn(colored_label(
+                        "Sign in with your wasd.dk account to use online features.",
+                        20.0,
+                        muted,
+                    ));
+                    for (title, value, focused, action) in [
+                        (
+                            "Username",
+                            online.username.clone(),
+                            !online.password_focus,
+                            Action::Username,
+                        ),
+                        (
+                            "Password",
+                            "*".repeat(online.password.chars().count()),
+                            online.password_focus,
+                            Action::Password,
+                        ),
+                    ] {
+                        parent
+                            .spawn(Node {
+                                flex_direction: FlexDirection::Column,
+                                row_gap: px(8),
+                                ..default()
+                            })
+                            .with_children(|parent| {
+                                parent.spawn(colored_label(title, 20.0, muted));
+                                parent
+                                    .spawn((
+                                        Button,
+                                        action,
+                                        Node {
+                                            width: percent(100),
+                                            min_height: px(56),
+                                            padding: UiRect::axes(px(24), px(12)),
+                                            border: UiRect::all(px(1)),
+                                            align_items: AlignItems::Center,
+                                            overflow: Overflow::clip(),
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::BLACK),
+                                        BorderColor::all(if focused {
+                                            Color::WHITE
+                                        } else {
+                                            Color::srgb(0.2, 0.2, 0.2)
+                                        }),
+                                        BorderRadius::all(px(28)),
+                                    ))
+                                    .with_children(|parent| {
+                                        parent.spawn(colored_label(
+                                            if value.is_empty() {
+                                                title.to_string()
+                                            } else {
+                                                value.clone()
+                                            },
+                                            20.0,
+                                            if value.is_empty() {
+                                                muted
+                                            } else {
+                                                Color::WHITE
+                                            },
+                                        ));
+                                    });
+                            });
+                    }
+                    parent
+                        .spawn((
+                            Button,
+                            Action::Remember,
+                            Node {
+                                align_items: AlignItems::Center,
+                                column_gap: px(16),
+                                ..default()
+                            },
+                        ))
+                        .with_children(|parent| {
+                            parent
+                                .spawn((
+                                    Node {
+                                        width: px(30),
+                                        height: px(30),
+                                        border: UiRect::all(px(1)),
+                                        align_items: AlignItems::Center,
+                                        justify_content: JustifyContent::Center,
+                                        ..default()
+                                    },
+                                    BorderColor::all(muted),
+                                    BorderRadius::all(px(15)),
+                                ))
+                                .with_children(|parent| {
+                                    if online.remember {
+                                        parent.spawn((
+                                            Node {
+                                                width: px(8),
+                                                height: px(16),
+                                                border: UiRect {
+                                                    right: px(3),
+                                                    bottom: px(3),
+                                                    ..default()
+                                                },
+                                                ..default()
+                                            },
+                                            BorderColor::all(Color::WHITE),
+                                            UiTransform::from_rotation(Rot2::degrees(45.0)),
+                                        ));
+                                    }
+                                });
+                            parent.spawn(label("Remember login", 22.0));
+                        });
+                    if !online.message.is_empty() {
+                        parent.spawn(colored_label(&online.message, 16.0, muted));
+                    }
+                    parent
+                        .spawn(Node {
+                            justify_content: JustifyContent::End,
+                            column_gap: px(12),
+                            ..default()
+                        })
+                        .with_children(|parent| {
+                            custom_button(parent, "Cancel", Action::CancelLogin, 116.0, false);
+                            if login_ready(online) {
+                                custom_button(parent, "Sign in", Action::SignIn, 116.0, true);
+                            } else {
+                                parent
+                                    .spawn((
+                                        Node {
+                                            width: px(116),
+                                            padding: UiRect::axes(px(12), px(10)),
+                                            align_items: AlignItems::Center,
+                                            justify_content: JustifyContent::Center,
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.04, 0.04, 0.04)),
+                                        BorderRadius::all(px(28)),
+                                    ))
+                                    .with_children(|parent| {
+                                        parent.spawn(colored_label(
+                                            if online.busy() {
+                                                "Signing in..."
+                                            } else {
+                                                "Sign in"
+                                            },
+                                            20.0,
+                                            muted,
+                                        ));
+                                    });
+                            }
+                        });
+                });
+        });
+}
+
 fn build_screen(commands: &mut Commands, game: &Game) {
+    if let Some(settings) = game.custom_dialog {
+        build_custom_dialog(commands, game, settings);
+    }
+    if game.online.login_open {
+        build_login_dialog(commands, game);
+    }
     commands
         .spawn((
             Screen,
@@ -320,49 +926,167 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                 bottom: px(0),
                 left: px(0),
                 width: percent(100),
-                height: px(84),
-                min_height: px(84),
-                flex_direction: FlexDirection::Column,
+                height: px(FOOTER_HEIGHT),
+                min_height: px(FOOTER_HEIGHT),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                flex_wrap: FlexWrap::Wrap,
+                column_gap: px(12),
                 row_gap: px(4),
                 flex_shrink: 0.0,
-                padding: UiRect::axes(px(16), px(8)),
-                overflow: Overflow::clip(),
+                padding: UiRect::axes(px(12), px(4)),
+                overflow: Overflow::scroll_y(),
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.12, 0.17, 0.23)),
+            BackgroundColor(Color::BLACK),
             GlobalZIndex(10),
         ))
         .with_children(|parent| {
             parent
                 .spawn(Node {
-                    column_gap: px(12),
+                    column_gap: px(4),
+                    align_items: AlignItems::Center,
+                    flex_wrap: FlexWrap::Wrap,
+                    ..default()
+                })
+                .with_children(|parent| {
+                    let account = game
+                        .online
+                        .session
+                        .as_ref()
+                        .map_or("Not signed in".to_string(), |session| {
+                            format!("Signed in ({})", session.display_name)
+                        });
+                    footer_button(
+                        parent,
+                        &account,
+                        if game.online.session.is_some() {
+                            Action::Logout
+                        } else {
+                            Action::Login
+                        },
+                        Color::WHITE,
+                    );
+                    parent.spawn(label("\u{00b7}", 14.0));
+                    footer_button(
+                        parent,
+                        if ranked_game(game) {
+                            "Online ranked mode"
+                        } else {
+                            "Offline unranked"
+                        },
+                        Action::Ranked,
+                        if ranked_game(game) {
+                            Color::WHITE
+                        } else {
+                            number_color(3)
+                        },
+                    );
+                    parent.spawn(label("\u{00b7}", 14.0));
+                    footer_button(parent, "F2 Leaderboard", Action::Scores, Color::WHITE);
+                });
+            parent
+                .spawn(Node {
+                    flex_grow: 1.0,
+                    flex_basis: px(140),
+                    min_width: px(100),
+                    flex_direction: FlexDirection::Column,
                     align_items: AlignItems::Center,
                     ..default()
                 })
                 .with_children(|parent| {
-                    parent.spawn((label("", 16.0), StatusText));
-                    button(
+                    parent.spawn((label("", 14.0), GameMessage));
+                    parent.spawn(label(&game.online.message, 14.0));
+                    if let Some(error) = &game.settings_error {
+                        parent.spawn(colored_label(error, 14.0, number_color(3)));
+                    }
+                    if game.online.needs_refresh && !game.online.busy() {
+                        footer_button(parent, "Refresh board", Action::RefreshBoard, Color::WHITE);
+                    }
+                    if game.online.game_id.is_some()
+                        && game.board.status == Status::Won
+                        && !game.online.submitted
+                    {
+                        footer_button(parent, "Submit score", Action::SubmitScore, Color::WHITE);
+                    }
+                });
+            parent
+                .spawn(Node {
+                    column_gap: px(4),
+                    margin: UiRect::left(Val::Auto),
+                    align_items: AlignItems::Center,
+                    flex_wrap: FlexWrap::Wrap,
+                    ..default()
+                })
+                .with_children(|parent| {
+                    footer_button(
                         parent,
                         if game.flag_mode {
-                            "(F) Flag mode: ON"
+                            "(F) Flag: ON"
                         } else {
-                            "(F) Flag mode: OFF"
+                            "(F) Flag"
                         },
                         Action::FlagMode,
+                        Color::WHITE,
                     );
-                    button(parent, "Fullscreen (F11)", Action::Fullscreen);
-                    button(parent, "F1 - How to play", Action::Help);
-                    button(
+                    footer_button(parent, "F1 Help", Action::Help, Color::WHITE);
+                    footer_button(
                         parent,
                         if game.zoomed {
-                            "Zoom 2x (F5)"
+                            "F5 Zoom x2"
                         } else {
-                            "Zoom 1x (F5)"
+                            "F5 Zoom x1"
                         },
                         Action::Zoom,
+                        Color::WHITE,
                     );
+                    footer_button(parent, "F12 Fullscreen", Action::Fullscreen, Color::WHITE);
                 });
-            parent.spawn(label(&game.online.message, 16.0));
+        });
+    commands
+        .spawn((
+            Screen,
+            GameControls,
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: px(FOOTER_HEIGHT),
+                width: percent(100),
+                height: px(MENU_HEIGHT),
+                padding: UiRect::axes(px(16), px(8)),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                column_gap: px(16),
+                flex_wrap: FlexWrap::Wrap,
+                overflow: Overflow::scroll_y(),
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.07, 0.09, 0.13)),
+            GlobalZIndex(10),
+        ))
+        .with_children(|parent| {
+            parent
+                .spawn(Node {
+                    column_gap: px(8),
+                    flex_wrap: FlexWrap::Wrap,
+                    ..default()
+                })
+                .with_children(|parent| {
+                    button(parent, "Beginner", Action::Beginner);
+                    button(parent, "Intermediate", Action::Intermediate);
+                    button(parent, "Advanced", Action::Advanced);
+                    button(parent, "Custom", Action::Custom);
+                });
+            parent
+                .spawn(Node {
+                    column_gap: px(12),
+                    align_items: AlignItems::Center,
+                    flex_wrap: FlexWrap::Wrap,
+                    ..default()
+                })
+                .with_children(|parent| {
+                    button(parent, "New game (N)", Action::NewGame);
+                    parent.spawn((label("", 16.0), StatusText));
+                });
         });
     if game.help_open && !game.quit_confirmation {
         commands.spawn((
@@ -379,54 +1103,43 @@ fn build_screen(commands: &mut Commands, game: &Game) {
             parent.spawn(Node { flex_direction: FlexDirection::Column, row_gap: px(12), padding: UiRect::all(px(24)), ..default() })
                 .with_children(|parent| {
                     parent.spawn(label("How to play", 28.0));
-                    parent.spawn(label("Reveal all safe tiles without hitting a mine.\nNumbers count mines in the eight neighboring tiles.\nLeft click: reveal. Right click: flag.\nClick a number or middle / left+right click: chord when flags match.\nOtherwise, middle click flashes uncleared neighbors.\nF: flag mode. N: new game. F2: online leaderboard.\nF5: toggle 2x board zoom. Wheel: scroll; Shift+wheel: sideways.\nF11: fullscreen. Ctrl+Q: quit (confirmation during active games).\nOffline and Custom games are unranked.", 18.0));
+                    parent.spawn(label("Reveal all safe tiles without stepping on a makibishi.\nNumbers count makibishi in the eight neighboring tiles.\nLeft click: reveal. Right click: flag.\nClick a number or middle / left+right click: chord when flags match.\nOtherwise, middle click flashes uncleared neighbors.\nF: flag mode. N: new game. F2: online leaderboard.\nF5: toggle 2x board zoom. Wheel: scroll; Shift+wheel: sideways.\nF12: fullscreen. Ctrl+Q: quit (confirmation during active games).\nOffline and Custom games are unranked.", 18.0));
                     button(parent, "Close (F1 / Esc)", Action::CloseHelp);
                 });
         });
     }
     if let Some(over) = game.game_over.as_ref().filter(|_| !game.quit_confirmation) {
-        commands
-            .spawn((
-                Screen,
-                Node {
-                    position_type: PositionType::Absolute,
-                    width: percent(100),
-                    height: percent(100),
-                    align_items: AlignItems::Center,
-                    justify_content: JustifyContent::Center,
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
-                GlobalZIndex(20),
-            ))
-            .with_children(|parent| {
-                parent
-                    .spawn((
+        if !over.won {
+            commands
+                .spawn((
+                    Screen,
+                    LossOverlay,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: percent(100),
+                        height: percent(100),
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
+                    bevy::ui::FocusPolicy::Block,
+                    GlobalZIndex(20),
+                ))
+                .with_children(|parent| {
+                    parent.spawn((
                         Node {
-                            flex_direction: FlexDirection::Column,
-                            row_gap: px(12),
-                            padding: UiRect::all(px(24)),
+                            height: percent(80),
+                            max_width: percent(90),
+                            aspect_ratio: Some(891.0 / 881.0),
                             ..default()
                         },
-                        BackgroundColor(Color::srgb(0.12, 0.17, 0.23)),
-                    ))
-                    .with_children(|parent| {
-                        let (title, color) = if over.won {
-                            ("You won!", Color::srgb(0.35, 0.85, 0.45))
-                        } else {
-                            ("You lost", Color::srgb(1.0, 0.4, 0.4))
-                        };
-                        parent.spawn(colored_label(title, 30.0, color));
-                        parent.spawn(label(&over.reason, 18.0));
-                        parent.spawn(label(
-                            format!("Time: {:.2}s", over.elapsed_ms as f64 / 1000.0),
-                            18.0,
-                        ));
-                        parent.spawn(label(recording_text(over, &game.online), 18.0));
-                        parent.spawn(label(placement_text(over, &game.online), 18.0));
-                        button(parent, "Close (Esc)", Action::CloseGameOver);
-                    });
-            });
+                        ImageNode::new(game.loss_image.clone()),
+                    ));
+                });
+        } else {
+            build_win_screen(commands, game, over);
+        }
     }
     if let Some(lost) = game
         .connection
@@ -522,7 +1235,10 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                         ..default()
                     })
                     .with_children(|parent| {
-                        parent.spawn(label("A game is in progress. Quit Minesweeper?", 24.0));
+                        parent.spawn(label(
+                            "A game is in progress. Quit Makibishi Sweeper?",
+                            24.0,
+                        ));
                         parent
                             .spawn(Node {
                                 column_gap: px(12),
@@ -545,7 +1261,7 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                 align_items: AlignItems::Center,
                 row_gap: px(12),
                 padding: UiRect {
-                    bottom: px(100),
+                    bottom: px(168),
                     ..UiRect::all(px(16))
                 },
                 overflow: Overflow::scroll_y(),
@@ -563,92 +1279,31 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                     ..default()
                 },
             ));
-            let account = game.online.session.as_ref().map_or(
-                "Playing anonymously. Sign in for online ranked games.".to_string(),
-                |session| format!("Signed in as {}", session.display_name),
-            );
-            parent.spawn(label(account, 16.0));
-            parent
-                .spawn(Node {
-                    column_gap: px(8),
-                    ..default()
-                })
-                .with_children(|parent| {
-                    if game.online.session.is_some() {
-                        button(parent, "Sign out", Action::Logout);
-                        button(
-                            parent,
-                            if game.online.ranked {
-                                "Online mode: ON"
-                            } else {
-                                "Online mode: OFF"
-                            },
-                            Action::Ranked,
-                        );
+            let account = if ranked_game(game) {
+                game.online
+                    .session
+                    .as_ref()
+                    .map_or("Online".to_string(), |session| {
+                        format!("Online as {}", session.display_name)
+                    })
+            } else {
+                "Offline".to_string()
+            };
+            parent.spawn((
+                colored_label(
+                    account,
+                    16.0,
+                    if ranked_game(game) {
+                        Color::WHITE
                     } else {
-                        button(parent, "Sign in", Action::Login);
-                    }
-                    button(parent, "Online leaderboard (F2)", Action::Scores);
-                    if game.online.needs_refresh && !game.online.busy() {
-                        button(parent, "Refresh board", Action::RefreshBoard);
-                    }
-                    if game.online.game_id.is_some()
-                        && game.board.status == Status::Won
-                        && !game.online.submitted
-                    {
-                        button(parent, "Submit score", Action::SubmitScore);
-                    }
-                });
-            if game.online.login_open {
-                parent.spawn(label(
-                    "Sign in with your wasd.dk account (Tab switches fields; Enter signs in).",
-                    18.0,
-                ));
-                parent
-                    .spawn(Node {
-                        column_gap: px(8),
-                        ..default()
-                    })
-                    .with_children(|parent| {
-                        button(
-                            parent,
-                            &format!(
-                                "{}Username: {}",
-                                if game.online.password_focus { "" } else { "> " },
-                                game.online.username
-                            ),
-                            Action::Username,
-                        );
-                        button(
-                            parent,
-                            &format!(
-                                "{}Password: {}",
-                                if game.online.password_focus { "> " } else { "" },
-                                "*".repeat(game.online.password.chars().count())
-                            ),
-                            Action::Password,
-                        );
-                    });
-                parent
-                    .spawn(Node {
-                        column_gap: px(8),
-                        ..default()
-                    })
-                    .with_children(|parent| {
-                        button(
-                            parent,
-                            if game.online.remember {
-                                "Remember login: YES"
-                            } else {
-                                "Remember login: NO"
-                            },
-                            Action::Remember,
-                        );
-                        button(parent, "Sign in", Action::SignIn);
-                        button(parent, "Cancel", Action::CancelLogin);
-                    });
-                return;
-            }
+                        number_color(3)
+                    },
+                ),
+                Node {
+                    align_self: AlignSelf::End,
+                    ..default()
+                },
+            ));
             if game.online.show_scores {
                 parent.spawn(label(
                     "Top 10 server-managed games per difficulty (* = guest account not verified)",
@@ -696,42 +1351,61 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                 button(parent, "Back to game", Action::BackToGame);
                 return;
             }
-            parent
-                .spawn(Node {
-                    column_gap: px(8),
-                    ..default()
-                })
-                .with_children(|parent| {
-                    button(parent, "Beginner", Action::Beginner);
-                    button(parent, "Intermediate", Action::Intermediate);
-                    button(parent, "Advanced", Action::Advanced);
-                    button(parent, "Custom", Action::Custom);
-                    button(parent, "New game (N)", Action::NewGame);
-                });
-            if game.custom {
-                parent.spawn(label(
-                    format!(
-                        "Custom: {} rows, {} columns, {} mines",
-                        game.custom_rows, game.custom_columns, game.custom_mines
-                    ),
-                    18.0,
-                ));
-                parent
-                    .spawn(Node {
-                        column_gap: px(8),
-                        ..default()
-                    })
-                    .with_children(|parent| {
-                        button(parent, "Rows -", Action::Rows(-1));
-                        button(parent, "Rows +", Action::Rows(1));
-                        button(parent, "Columns -", Action::Columns(-1));
-                        button(parent, "Columns +", Action::Columns(1));
-                        button(parent, "Mines -", Action::Mines(-1));
-                        button(parent, "Mines +", Action::Mines(1));
-                    });
-            }
             let scale = if game.zoomed { 2.0 } else { 1.0 };
             let tile_size = board_tile_size(game);
+            for edge in [
+                BoardEdge::Top,
+                BoardEdge::Right,
+                BoardEdge::Bottom,
+                BoardEdge::Left,
+            ] {
+                let angle = match edge {
+                    BoardEdge::Top => LinearGradient::TO_BOTTOM,
+                    BoardEdge::Right => LinearGradient::TO_LEFT,
+                    BoardEdge::Bottom => LinearGradient::TO_TOP,
+                    BoardEdge::Left => LinearGradient::TO_RIGHT,
+                };
+                let rotation = match edge {
+                    BoardEdge::Top => -90.0,
+                    BoardEdge::Right => 0.0,
+                    BoardEdge::Bottom => 90.0,
+                    BoardEdge::Left => 180.0,
+                };
+                parent
+                    .commands()
+                    .spawn((
+                        Screen,
+                        edge,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            display: Display::None,
+                            ..default()
+                        },
+                        BackgroundGradient::from(LinearGradient::new(
+                            angle,
+                            vec![
+                                ColorStop::new(Color::srgba(0.0, 0.0, 0.0, 0.5), percent(0)),
+                                ColorStop::new(Color::srgba(0.0, 0.0, 0.0, 0.0), percent(100)),
+                            ],
+                        )),
+                        bevy::ui::FocusPolicy::Pass,
+                        GlobalZIndex(5),
+                    ))
+                    .with_children(|parent| {
+                        parent.spawn((
+                            BoardChevron,
+                            ImageNode::new(game.chevron.clone()),
+                            Node {
+                                position_type: PositionType::Absolute,
+                                width: px(9),
+                                height: px(14),
+                                ..default()
+                            },
+                            UiTransform::from_rotation(Rot2::degrees(rotation)),
+                            bevy::ui::FocusPolicy::Pass,
+                        ));
+                    });
+            }
             parent
                 .spawn((
                     BoardViewport,
@@ -746,19 +1420,22 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                 ))
                 .with_children(|parent| {
                     parent
-                        .spawn(Node {
-                            display: Display::Grid,
-                            grid_template_columns: vec![
-                                GridTrack::px(tile_size);
-                                game.board.columns
-                            ],
-                            grid_template_rows: vec![GridTrack::px(tile_size); game.board.rows],
-                            column_gap: px(2.0 * scale),
-                            row_gap: px(2.0 * scale),
-                            margin: UiRect::all(Val::Auto),
-                            flex_shrink: 0.0,
-                            ..default()
-                        })
+                        .spawn((
+                            BoardGrid,
+                            Node {
+                                display: Display::Grid,
+                                grid_template_columns: vec![
+                                    GridTrack::px(tile_size);
+                                    game.board.columns
+                                ],
+                                grid_template_rows: vec![GridTrack::px(tile_size); game.board.rows],
+                                column_gap: px(2.0 * scale),
+                                row_gap: px(2.0 * scale),
+                                margin: UiRect::all(Val::Auto),
+                                flex_shrink: 0.0,
+                                ..default()
+                            },
+                        ))
                         .with_children(|parent| {
                             for (index, cell) in game.board.cells.iter().enumerate() {
                                 let show_mine = cell.mine
@@ -815,6 +1492,22 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                                     });
                                 }
                                 tile.with_children(|parent| {
+                                    if game.board.status == Status::Lost
+                                        && game.triggered_mine == Some(index)
+                                    {
+                                        parent.spawn((
+                                            TriggeredMineHighlight,
+                                            Node {
+                                                position_type: PositionType::Absolute,
+                                                width: percent(100),
+                                                height: percent(100),
+                                                border: UiRect::all(px(3.0 * scale)),
+                                                ..default()
+                                            },
+                                            BorderColor::all(Color::srgb(1.0, 0.85, 0.1)),
+                                            bevy::ui::FocusPolicy::Pass,
+                                        ));
+                                    }
                                     let text_color = if cell.revealed && !show_mine {
                                         number_color(cell.count)
                                     } else {
@@ -828,11 +1521,246 @@ fn build_screen(commands: &mut Commands, game: &Game) {
         });
 }
 
+fn build_win_screen(commands: &mut Commands, game: &Game, over: &GameOver) {
+    commands
+        .spawn((
+            Screen,
+            WinOverlay,
+            Node {
+                position_type: PositionType::Absolute,
+                width: percent(100),
+                height: percent(100),
+                align_items: AlignItems::Center,
+                column_gap: px(24),
+                padding: UiRect::all(px(24)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.9)),
+            bevy::ui::FocusPolicy::Block,
+            GlobalZIndex(20),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Node {
+                    width: percent(50),
+                    max_width: Val::Vh(90.0 * 921.0 / 760.0),
+                    aspect_ratio: Some(921.0 / 760.0),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+                ImageNode::new(game.win_image.clone()),
+            ));
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    flex_grow: 1.0,
+                    min_width: px(0),
+                    max_height: percent(90),
+                    row_gap: px(10),
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                })
+                .with_children(|parent| {
+                    let mut highlighted = false;
+                    if let Some(mode) = over.mode {
+                        parent.spawn(label(format!("{} - Top 10", mode_title(mode)), 24.0));
+                        match over.lookup {
+                            Lookup::Waiting | Lookup::Requested => {
+                                parent.spawn(label("Loading leaderboard...", 18.0));
+                            }
+                            Lookup::Unavailable => {
+                                parent.spawn(colored_label(
+                                    "Leaderboard unavailable.",
+                                    18.0,
+                                    number_color(3),
+                                ));
+                            }
+                            Lookup::Ready => {
+                                let scores = mode_scores(mode, &game.online);
+                                let place = recorded_place(over, &game.online);
+                                if scores.is_empty() {
+                                    parent.spawn(label("No scores yet.", 18.0));
+                                }
+                                for (index, score) in
+                                    scores.iter().take(LEADERBOARD_SIZE).enumerate()
+                                {
+                                    let selected = place == Some(index);
+                                    parent
+                                        .spawn(Node {
+                                            width: percent(100),
+                                            padding: UiRect::all(px(6)),
+                                            align_items: AlignItems::Center,
+                                            column_gap: px(8),
+                                            ..default()
+                                        })
+                                        .with_children(|row| {
+                                            let mut marker = row.spawn((
+                                                Node {
+                                                    width: px(9),
+                                                    height: px(14),
+                                                    flex_shrink: 0.0,
+                                                    ..default()
+                                                },
+                                                ImageNode::new(game.chevron.clone()),
+                                                if selected {
+                                                    Visibility::Inherited
+                                                } else {
+                                                    Visibility::Hidden
+                                                },
+                                            ));
+                                            if selected {
+                                                marker.insert(WinningScore);
+                                            }
+                                            row.spawn(label(
+                                                format!(
+                                                    "{}. {}{} - {:.2}s",
+                                                    index + 1,
+                                                    score.player_name,
+                                                    if score.user_id.is_none() { " *" } else { "" },
+                                                    score.elapsed_ms as f64 / 1000.0
+                                                ),
+                                                18.0,
+                                            ));
+                                        });
+                                    if selected {
+                                        highlighted = true;
+                                    }
+                                }
+                            }
+                            Lookup::NotApplicable => {}
+                        }
+                    }
+                    if !highlighted || over.recording != Recording::Recorded {
+                        parent.spawn(label(
+                            format!("Your time: {:.2}s", over.elapsed_ms as f64 / 1000.0),
+                            22.0,
+                        ));
+                        if over.mode.is_some() {
+                            parent.spawn(label(placement_text(over, &game.online), 16.0));
+                        }
+                    }
+                    parent.spawn(label(recording_text(over, &game.online), 16.0));
+                });
+        });
+}
+
+fn mode_scores<'a>(mode: &str, online: &'a Online) -> &'a [online::Score] {
+    match mode {
+        "intermediate" => &online.scores.intermediate,
+        "advanced" => &online.scores.advanced,
+        _ => &online.scores.easy,
+    }
+}
+
+fn recorded_place(over: &GameOver, online: &Online) -> Option<usize> {
+    if over.recording != Recording::Recorded {
+        return None;
+    }
+    let scores = mode_scores(over.mode?, online);
+    let player = online.session.as_ref()?.display_name.as_str();
+    scores
+        .iter()
+        .take(LEADERBOARD_SIZE)
+        .rposition(|score| score.elapsed_ms == over.elapsed_ms && score.player_name == player)
+}
+
 fn board_tile_size(game: &Game) -> f32 {
     (1000.0 / game.board.columns as f32)
         .min(580.0 / game.board.rows as f32)
         .min(34.0)
         * if game.zoomed { 2.0 } else { 1.0 }
+}
+
+fn board_edge_rect(edge: BoardEdge, board: Rect, viewport: Rect) -> Option<Rect> {
+    let visible = Rect {
+        min: board.min.max(viewport.min),
+        max: board.max.min(viewport.max),
+    };
+    if visible.max.cmple(visible.min).any() {
+        return None;
+    }
+    let clipped = match edge {
+        BoardEdge::Top => board.min.y < viewport.min.y - 0.5,
+        BoardEdge::Right => board.max.x > viewport.max.x + 0.5,
+        BoardEdge::Bottom => board.max.y > viewport.max.y + 0.5,
+        BoardEdge::Left => board.min.x < viewport.min.x - 0.5,
+    };
+    if !clipped {
+        return None;
+    }
+    let mut rect = visible;
+    match edge {
+        BoardEdge::Top => rect.max.y = (rect.min.y + 8.0).min(rect.max.y),
+        BoardEdge::Right => rect.min.x = (rect.max.x - 8.0).max(rect.min.x),
+        BoardEdge::Bottom => rect.min.y = (rect.max.y - 8.0).max(rect.min.y),
+        BoardEdge::Left => rect.max.x = (rect.min.x + 8.0).min(rect.max.x),
+    }
+    Some(rect)
+}
+
+fn update_board_edges(
+    viewport: Query<(&ComputedNode, &UiGlobalTransform), With<BoardViewport>>,
+    grid: Query<(&ComputedNode, &UiGlobalTransform), With<BoardGrid>>,
+    mut edges: Query<(&BoardEdge, &mut Node, &Children), Without<BoardChevron>>,
+    mut chevrons: Query<(&mut Node, &mut Visibility), (With<BoardChevron>, Without<BoardEdge>)>,
+    windows: Query<&Window>,
+) {
+    let bounds = |node: &ComputedNode, transform: &UiGlobalTransform| {
+        let center = transform.translation * node.inverse_scale_factor;
+        Rect::from_center_size(center, node.size() * node.inverse_scale_factor)
+    };
+    let rects = viewport.single().ok().zip(grid.single().ok());
+    let pointer = windows.single().ok().and_then(|window| {
+        window.physical_cursor_position().and_then(|position| {
+            viewport
+                .single()
+                .ok()
+                .map(|(node, _)| position * node.inverse_scale_factor)
+        })
+    });
+    for (edge, mut node, children) in &mut edges {
+        let rect = rects.and_then(|((viewport, viewport_transform), (grid, grid_transform))| {
+            board_edge_rect(
+                *edge,
+                bounds(grid, grid_transform),
+                bounds(viewport, viewport_transform),
+            )
+        });
+        if let Some(rect) = rect {
+            node.display = Display::Flex;
+            node.left = px(rect.min.x);
+            node.top = px(rect.min.y);
+            node.width = px(rect.width());
+            node.height = px(rect.height());
+            let center = board_chevron_center(*edge, rect.size());
+            for child in children {
+                if let Ok((mut chevron, mut visibility)) = chevrons.get_mut(*child) {
+                    chevron.left = px(center.x - 4.5);
+                    chevron.top = px(center.y - 7.0);
+                    *visibility = if pointer_near_chevron(pointer, rect.min + center) {
+                        Visibility::Hidden
+                    } else {
+                        Visibility::Inherited
+                    };
+                }
+            }
+        } else {
+            node.display = Display::None;
+        }
+    }
+}
+
+fn board_chevron_center(edge: BoardEdge, fade_size: Vec2) -> Vec2 {
+    match edge {
+        BoardEdge::Top => Vec2::new(fade_size.x / 2.0, -4.5),
+        BoardEdge::Right => Vec2::new(fade_size.x + 4.5, fade_size.y / 2.0),
+        BoardEdge::Bottom => Vec2::new(fade_size.x / 2.0, fade_size.y + 4.5),
+        BoardEdge::Left => Vec2::new(-4.5, fade_size.y / 2.0),
+    }
+}
+
+fn pointer_near_chevron(pointer: Option<Vec2>, center: Vec2) -> bool {
+    pointer.is_some_and(|pointer| pointer.distance(center) <= 24.0)
 }
 
 fn scroll_board(
@@ -843,6 +1771,7 @@ fn scroll_board(
 ) {
     for event in wheel.read() {
         if game.help_open
+            || game.custom_dialog.is_some()
             || game.quit_confirmation
             || game.game_over.is_some()
             || game.connection.is_some()
@@ -886,6 +1815,8 @@ fn new_board(game: &mut Game) {
         (game.board.rows, game.board.columns, game.board.mines)
     };
     game.board = Board::new(rows, columns, mines);
+    game.triggered_mine = None;
+    game.last_move = None;
     game.elapsed = 0.0;
     game.board_scroll = Vec2::ZERO;
     game.online.game_id = None;
@@ -900,6 +1831,28 @@ fn new_board(game: &mut Game) {
         };
         game.online.dispatch(Operation::Start { mode: mode.into() });
     }
+}
+
+fn start_custom(game: &mut Game) {
+    let Some(settings) = game.custom_dialog else {
+        return;
+    };
+    if game.settings_path.is_none() && game.settings_error.is_some() {
+        return;
+    }
+    if let Some(path) = &game.settings_path
+        && let Err(error) = custom::save(path, settings)
+    {
+        game.settings_error = Some(error);
+        return;
+    }
+    game.custom_rows = settings.rows;
+    game.custom_columns = settings.columns;
+    game.custom_mines = settings.mines;
+    game.custom = true;
+    game.custom_dialog = None;
+    game.settings_error = None;
+    new_board(game);
 }
 
 fn fullscreen(window: &mut Window) {
@@ -962,6 +1915,19 @@ fn keyboard(
         }
         return;
     }
+    if game.custom_dialog.is_some() {
+        if keys.just_pressed(KeyCode::Escape) {
+            game.custom_dialog = None;
+            rebuild(&mut commands, &screen, &game);
+        } else if keys.just_pressed(KeyCode::Enter) && !game.online.busy() {
+            start_custom(&mut game);
+            rebuild(&mut commands, &screen, &game);
+        }
+        return;
+    }
+    if game.online.login_open {
+        return;
+    }
     if keys.just_pressed(KeyCode::F2) {
         toggle_scores(&mut game.online);
         rebuild(&mut commands, &screen, &game);
@@ -981,7 +1947,7 @@ fn keyboard(
         rebuild(&mut commands, &screen, &game);
         return;
     }
-    if keys.just_pressed(KeyCode::F11) {
+    if keys.just_pressed(KeyCode::F12) {
         for mut window in &mut windows {
             fullscreen(&mut window);
         }
@@ -1022,10 +1988,38 @@ fn controls(
         if game.help_open && !matches!(action, Action::Help | Action::CloseHelp) {
             continue;
         }
-        if game.game_over.is_some() && !matches!(action, Action::CloseGameOver) {
+        if game.game_over.is_some() {
             continue;
         }
         if game.connection.is_some() && !matches!(action, Action::RetryNow | Action::StopRetrying) {
+            continue;
+        }
+        if game.custom_dialog.is_some()
+            && !matches!(
+                action,
+                Action::StartCustom
+                    | Action::ResetCustom
+                    | Action::CloseCustom
+                    | Action::Rows(_)
+                    | Action::Columns(_)
+                    | Action::Mines(_)
+            )
+        {
+            continue;
+        }
+        if game.online.login_open
+            && !matches!(
+                action,
+                Action::Username
+                    | Action::Password
+                    | Action::Remember
+                    | Action::SignIn
+                    | Action::CancelLogin
+            )
+        {
+            continue;
+        }
+        if game.online.show_scores && !matches!(action, Action::Scores | Action::BackToGame) {
             continue;
         }
         if game.online.busy()
@@ -1038,7 +2032,6 @@ fn controls(
                     | Action::CancelQuit
                     | Action::Help
                     | Action::CloseHelp
-                    | Action::CloseGameOver
                     | Action::Zoom
                     | Action::FlagMode
             )
@@ -1048,7 +2041,6 @@ fn controls(
         match action {
             Action::Help => game.help_open = !game.help_open,
             Action::CloseHelp => game.help_open = false,
-            Action::CloseGameOver => game.game_over = None,
             Action::RetryNow => dispatch_retry(&mut game),
             Action::StopRetrying => stop_retrying(&mut game),
             Action::Zoom => {
@@ -1073,19 +2065,31 @@ fn controls(
                 new_board(&mut game);
             }
             Action::Custom => {
-                game.custom = true;
-                new_board(&mut game);
+                game.custom_dialog = Some(custom::Settings {
+                    rows: game.custom_rows,
+                    columns: game.custom_columns,
+                    mines: game.custom_mines,
+                });
             }
+            Action::StartCustom => start_custom(&mut game),
+            Action::ResetCustom => game.custom_dialog = Some(custom::Settings::default()),
+            Action::CloseCustom => game.custom_dialog = None,
             Action::NewGame => new_board(&mut game),
             Action::FlagMode => game.flag_mode = !game.flag_mode,
             Action::Rows(delta) => {
-                game.custom_rows = (game.custom_rows as i32 + delta).clamp(5, 24) as usize
+                if let Some(settings) = &mut game.custom_dialog {
+                    settings.rows = (settings.rows as i32 + delta).clamp(5, 24) as usize;
+                }
             }
             Action::Columns(delta) => {
-                game.custom_columns = (game.custom_columns as i32 + delta).clamp(5, 30) as usize
+                if let Some(settings) = &mut game.custom_dialog {
+                    settings.columns = (settings.columns as i32 + delta).clamp(5, 30) as usize;
+                }
             }
             Action::Mines(delta) => {
-                game.custom_mines = (game.custom_mines as i32 + delta).max(1) as usize
+                if let Some(settings) = &mut game.custom_dialog {
+                    settings.mines = (settings.mines as i32 + delta).max(1) as usize;
+                }
             }
             Action::Login => game.online.login_open = true,
             Action::Username => game.online.password_focus = false,
@@ -1100,8 +2104,12 @@ fn controls(
                 game.online.dispatch(Operation::Logout);
             }
             Action::Ranked => {
-                game.online.ranked = !game.online.ranked;
-                new_board(&mut game);
+                if game.online.session.is_none() {
+                    game.online.login_open = true;
+                } else {
+                    game.online.ranked = !game.online.ranked;
+                    new_board(&mut game);
+                }
             }
             Action::Scores => toggle_scores(&mut game.online),
             Action::BackToGame => game.online.show_scores = false,
@@ -1123,11 +2131,26 @@ fn controls(
                 }
             }
         }
-        game.custom_mines = game
-            .custom_mines
-            .min(game.custom_rows * game.custom_columns - 1);
+        if let Some(settings) = &mut game.custom_dialog {
+            settings.mines = settings.mines.min(settings.rows * settings.columns - 1);
+        }
         rebuild(&mut commands, &screen, &game);
         break;
+    }
+}
+
+fn dismiss_game_over_on_click(
+    mut commands: Commands,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut game: ResMut<Game>,
+    screen: Query<Entity, With<Screen>>,
+) {
+    if game.game_over.is_some()
+        && !game.quit_confirmation
+        && mouse.get_just_pressed().next().is_some()
+    {
+        game.game_over = None;
+        rebuild(&mut commands, &screen, &game);
     }
 }
 
@@ -1145,6 +2168,7 @@ fn tiles(
     screen: Query<Entity, With<Screen>>,
 ) {
     if game.board.status != Status::Playing
+        || game.custom_dialog.is_some()
         || game.help_open
         || game.quit_confirmation
         || game.game_over.is_some()
@@ -1225,10 +2249,36 @@ fn apply_move(game: &mut Game, index: usize, action: &'static str) {
         let was_playing = game.board.status == Status::Playing;
         game.board.reveal(index);
         if was_playing && game.board.status != Status::Playing {
+            game.triggered_mine = game
+                .board
+                .cells
+                .iter()
+                .position(|cell| cell.mine && cell.revealed);
             let elapsed_ms = (game.elapsed * 1000.0).round() as u64;
             finish_game(game, elapsed_ms);
         }
     }
+}
+
+fn online_triggered_mine(game: &Game, board: &Board) -> Option<usize> {
+    let (index, action) = game.last_move?;
+    if board.status != Status::Lost
+        || game.board.rows != board.rows
+        || game.board.columns != board.columns
+        || index >= board.cells.len()
+    {
+        return None;
+    }
+    if action == "reveal" {
+        return board.cells[index].mine.then_some(index);
+    }
+    if action == "chord" {
+        return game.board.neighbors(index).into_iter().find(|&neighbor| {
+            let before = game.board.cells[neighbor];
+            !before.revealed && !before.flagged && board.cells[neighbor].mine
+        });
+    }
+    None
 }
 
 fn leaderboard_mode(game: &Game) -> Option<&'static str> {
@@ -1253,6 +2303,9 @@ fn mode_title(mode: &str) -> &'static str {
 
 fn finish_game(game: &mut Game, elapsed_ms: u64) {
     let won = game.board.status == Status::Won;
+    if !won {
+        game.ruru.record_mine_hit();
+    }
     let reason = if won {
         "Every safe tile was cleared.".to_string()
     } else {
@@ -1262,13 +2315,13 @@ fn finish_game(game: &mut Game, elapsed_ms: u64) {
                 let column = index % game.board.columns + 1;
                 if action == "chord" {
                     format!(
-                        "Chording row {row}, column {column} opened a mine - a flag was misplaced."
+                        "Chording row {row}, column {column} revealed a makibishi - a flag was misplaced."
                     )
                 } else {
-                    format!("You revealed a mine at row {row}, column {column}.")
+                    format!("You stepped on a makibishi at row {row}, column {column}!")
                 }
             }
-            None => "A mine was revealed.".to_string(),
+            None => "You stepped on a makibishi!".to_string(),
         }
     };
     let mode = leaderboard_mode(game);
@@ -1447,19 +2500,22 @@ fn retry_connection(
 }
 
 fn recording_text(over: &GameOver, online: &Online) -> String {
+    let score = format!("Score of {:.2}s", over.elapsed_ms as f64 / 1000.0);
     match &over.recording {
-        Recording::Lost => "Score not recorded: only cleared boards are scored.".into(),
-        Recording::Custom => "Score not recorded: custom games are unranked.".into(),
+        Recording::Lost => format!("{score} not recorded: only cleared boards are scored."),
+        Recording::Custom => format!("{score} not recorded: custom games are unranked."),
         Recording::Offline if online.session.is_none() => {
-            "Score not recorded: offline games are unranked. Log in to play ranked.".into()
+            format!("{score} not recorded in offline mode (unranked). Log in to play ranked.")
         }
         Recording::Offline => {
-            "Score not recorded: offline games are unranked. Turn on ranked play to compete.".into()
+            format!(
+                "{score} not recorded in offline mode (unranked). Turn on ranked play to compete."
+            )
         }
-        Recording::Pending => "Recording score online...".into(),
-        Recording::Recorded => "Score recorded online.".into(),
+        Recording::Pending => format!("{score} being recorded online..."),
+        Recording::Recorded => format!("{score} recorded online."),
         Recording::Failed(error) => {
-            format!("Score not recorded online: {error} Use Submit score to retry.")
+            format!("{score} not recorded online: {error} Use Submit score to retry.")
         }
     }
 }
@@ -1477,17 +2533,9 @@ fn placement_text(over: &GameOver, online: &Online) -> String {
         Lookup::Unavailable => return "Leaderboard placement unavailable.".into(),
         Lookup::NotApplicable | Lookup::Ready => {}
     }
-    let scores = match mode {
-        "intermediate" => &online.scores.intermediate,
-        "advanced" => &online.scores.advanced,
-        _ => &online.scores.easy,
-    };
+    let scores = mode_scores(mode, online);
     if over.recording == Recording::Recorded {
-        let player = online.session.as_ref().map(|s| s.display_name.as_str());
-        let place = scores.iter().take(LEADERBOARD_SIZE).rposition(|s| {
-            s.elapsed_ms == over.elapsed_ms && Some(s.player_name.as_str()) == player
-        });
-        match place {
+        match recorded_place(over, online) {
             Some(index) => format!("Leaderboard: #{} on {title}.", index + 1),
             None => format!("Outside the {title} top {LEADERBOARD_SIZE}."),
         }
@@ -1507,6 +2555,9 @@ fn placement_text(over: &GameOver, online: &Online) -> String {
 }
 
 fn sign_in(online: &mut Online) {
+    if online.busy() {
+        return;
+    }
     if online.username.trim().is_empty() || online.password.is_empty() {
         online.message = "Enter your username and password.".into();
         return;
@@ -1680,6 +2731,11 @@ fn handle_online_reply(game: &mut Game, result: Result<Reply, online::ApiError>)
                     let recovered = game.connection.take();
                     match view.into_board() {
                         Ok((id, board, elapsed)) => {
+                            if was_playing {
+                                game.triggered_mine = online_triggered_mine(game, &board);
+                            } else if board.status == Status::Playing {
+                                game.triggered_mine = None;
+                            }
                             game.online.game_id = Some(id.clone());
                             game.online.needs_refresh = false;
                             game.board = board;
@@ -1758,34 +2814,743 @@ fn update_status(
     time: Res<Time>,
     mut game: ResMut<Game>,
     mut text: Query<&mut Text, With<StatusText>>,
+    mut messages: Query<(&mut Text, &mut TextFont), (With<GameMessage>, Without<StatusText>)>,
 ) {
     if game.board.started && game.board.status == Status::Playing {
         game.elapsed += time.delta_secs();
     }
     let flags = game.board.cells.iter().filter(|cell| cell.flagged).count();
-    let state = match game.board.status {
-        Status::Playing => "Good luck!",
-        Status::Won => "Board cleared!",
-        Status::Lost => "Mine hit!",
+    let ruru_visible = game.ruru.frame(0.0).is_some();
+    let state = if ruru_visible {
+        "\u{30eb}\u{30eb} doesn't judge.."
+    } else {
+        match game.board.status {
+            Status::Playing => "Good luck!",
+            Status::Won => "Board cleared!",
+            Status::Lost => "You stepped on a makibishi!",
+        }
     };
     for mut text in &mut text {
         **text = format!(
-            "Mines: {}   Time: {:.1}s   {}   {}",
+            "Makibishi: {} \u{00b7} Time: {:.1}s",
             game.board.mines as isize - flags as isize,
             game.elapsed,
-            state,
-            if game.online.game_id.is_some() {
-                "Online ranked"
-            } else {
-                "Offline / unranked"
-            }
         );
+    }
+    for (mut text, mut font) in &mut messages {
+        **text = state.to_string();
+        font.font = if ruru_visible {
+            game.ruru_font.clone()
+        } else {
+            Handle::default()
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_sound_decodes_as_vorbis_audio() {
+        use bevy::audio::Decodable;
+
+        let sound = AudioSource {
+            bytes: std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("sfx")
+                    .join("makibishi_intro.ogg"),
+            )
+            .unwrap()
+            .into(),
+        };
+        assert!(sound.decoder().any(|sample| sample != 0));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn app_icon_decodes_the_supplied_png() {
+        let image = image::load_from_memory(include_bytes!("..\\gfx\\makibishi-icon.png"))
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(image.dimensions(), (32, 32));
+        assert!(image.pixels().any(|pixel| pixel.0[3] == 0));
+        assert!(image.pixels().any(|pixel| pixel.0[3] > 0));
+        app_icon().unwrap();
+    }
+
+    #[test]
+    fn online_loss_highlights_only_triggered_tile_when_server_reveals_all_mines() {
+        for chord in [false, true] {
+            let mut game = Game::default();
+            game.board.started = true;
+            game.last_move = Some((
+                if chord { 10 } else { 20 },
+                if chord { "chord" } else { "reveal" },
+            ));
+            if chord {
+                game.board.cells[10].revealed = true;
+                game.board.cells[0].flagged = true;
+            }
+            let mut json = board_json(false);
+            json["status"] = "lost".into();
+            for index in [0, 20, 80] {
+                json["cells"][index]["mine"] = true.into();
+                json["cells"][index]["revealed"] = true.into();
+            }
+            for dismissed in [false, true] {
+                if dismissed {
+                    game.game_over = None;
+                }
+                handle_online_reply(
+                    &mut game,
+                    Ok(Reply::Board(serde_json::from_value(json.clone()).unwrap())),
+                );
+                assert_eq!(game.triggered_mine, Some(20));
+                let mut app = App::new();
+                let mut queue = bevy::ecs::world::CommandQueue::default();
+                build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+                queue.apply(app.world_mut());
+                let mut highlights = app
+                    .world_mut()
+                    .query_filtered::<&ChildOf, With<TriggeredMineHighlight>>();
+                let parent = highlights.single(app.world()).unwrap();
+                assert_eq!(app.world().get::<Tile>(parent.parent()).unwrap().0, 20);
+            }
+            new_board(&mut game);
+            assert_eq!(game.triggered_mine, None);
+            assert_eq!(game.last_move, None);
+        }
+    }
+
+    #[test]
+    fn triggered_mine_stays_highlighted_after_dismissal_and_clears_on_new_game() {
+        for chord in [false, true] {
+            for zoomed in [false, true] {
+                let mut game = Game {
+                    zoomed,
+                    ..default()
+                };
+                game.board.started = true;
+                game.board.cells[0].mine = true;
+                game.board.cells[80].mine = true;
+                if chord {
+                    game.board.cells[1].revealed = true;
+                    game.board.cells[1].count = 1;
+                    game.board.cells[2].flagged = true;
+                }
+                apply_move(
+                    &mut game,
+                    if chord { 1 } else { 0 },
+                    if chord { "chord" } else { "reveal" },
+                );
+                assert_eq!(game.board.status, Status::Lost);
+                for dismissed in [false, true] {
+                    if dismissed {
+                        game.game_over = None;
+                    }
+                    let mut app = App::new();
+                    let mut queue = bevy::ecs::world::CommandQueue::default();
+                    build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+                    queue.apply(app.world_mut());
+                    let mut highlights = app.world_mut().query_filtered::<(
+                        &ChildOf,
+                        &Node,
+                        &BorderColor,
+                        &bevy::ui::FocusPolicy,
+                    ), With<TriggeredMineHighlight>>(
+                    );
+                    let (parent, node, border, focus) = highlights.single(app.world()).unwrap();
+                    assert_eq!(app.world().get::<Tile>(parent.parent()).unwrap().0, 0);
+                    assert_eq!(node.border, UiRect::all(px(if zoomed { 6 } else { 3 })));
+                    assert_eq!(*border, BorderColor::all(Color::srgb(1.0, 0.85, 0.1)));
+                    assert_eq!(*focus, bevy::ui::FocusPolicy::Pass);
+                }
+                new_board(&mut game);
+                let mut app = App::new();
+                let mut queue = bevy::ecs::world::CommandQueue::default();
+                build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+                queue.apply(app.world_mut());
+                assert_eq!(
+                    app.world_mut()
+                        .query_filtered::<Entity, With<TriggeredMineHighlight>>()
+                        .iter(app.world())
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+
+    fn win_screen_app(mode: Option<&'static str>, recording: Recording, lookup: Lookup) -> App {
+        let mut game = Game::default();
+        game.board.status = Status::Won;
+        game.online.session = Some(online::Session {
+            token: "token".into(),
+            display_name: "Player".into(),
+        });
+        game.online.scores.easy = vec![score("Beginner player", 1000)];
+        game.online.scores.intermediate =
+            vec![score("Intermediate player", 2000), score("Player", 7500)];
+        game.online.scores.advanced = vec![score("Advanced player", 3000)];
+        game.game_over = Some(GameOver {
+            mode,
+            lookup,
+            ..won_over(7500, recording)
+        });
+        let mut app = App::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+        queue.apply(app.world_mut());
+        app.insert_resource(game);
+        app
+    }
+
+    #[test]
+    fn win_screen_has_art_left_and_only_current_mode_scores_right() {
+        for (mode, player) in [
+            ("easy", "Beginner player"),
+            ("intermediate", "Intermediate player"),
+            ("advanced", "Advanced player"),
+        ] {
+            let mut app = win_screen_app(Some(mode), Recording::Recorded, Lookup::Ready);
+            let mut overlay = app.world_mut().query_filtered::<
+                (&Node, &BackgroundColor, &GlobalZIndex, &Children),
+                With<WinOverlay>,
+            >();
+            let (node, color, z, children) = overlay.single(app.world()).unwrap();
+            assert_eq!(node.flex_direction, FlexDirection::Row);
+            assert_eq!(color.0.alpha(), 0.8);
+            assert!(z.0 < 30);
+            assert_eq!(children.len(), 2);
+            assert_eq!(
+                app.world().get::<ImageNode>(children[0]).unwrap().image,
+                app.world().resource::<Game>().win_image
+            );
+            assert_eq!(
+                app.world().get::<Node>(children[0]).unwrap().aspect_ratio,
+                Some(921.0 / 760.0)
+            );
+            let mut text = app.world_mut().query::<&Text>();
+            let lines: Vec<_> = text.iter(app.world()).map(|text| text.0.as_str()).collect();
+            assert!(lines.iter().any(|text| text.contains(player)));
+            assert!(!lines.iter().any(|text| {
+                *text == "You won!"
+                    || text.starts_with("Every safe tile")
+                    || text.starts_with("Click anywhere")
+            }));
+            for other in ["Beginner player", "Intermediate player", "Advanced player"] {
+                if other != player {
+                    assert!(!lines.iter().any(|text| text.contains(other)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn win_screen_marks_recorded_score_and_shows_unrecorded_time_below_board() {
+        for (recording, highlighted) in [
+            (Recording::Recorded, true),
+            (Recording::Offline, false),
+            (Recording::Failed("Submit failed".into()), false),
+        ] {
+            let mut app = win_screen_app(Some("intermediate"), recording.clone(), Lookup::Ready);
+            let mut selected = app
+                .world_mut()
+                .query_filtered::<(&ImageNode, &Node, &ChildOf), With<WinningScore>>();
+            assert_eq!(selected.iter(app.world()).count(), usize::from(highlighted));
+            if highlighted {
+                let (image, node, parent) = selected.single(app.world()).unwrap();
+                assert_eq!(image.image, app.world().resource::<Game>().chevron);
+                assert_eq!(node.width, px(9));
+                assert_eq!(node.height, px(14));
+                assert_eq!(
+                    app.world()
+                        .get::<BackgroundColor>(parent.parent())
+                        .unwrap()
+                        .0
+                        .alpha(),
+                    0.0
+                );
+                let children = app.world().get::<Children>(parent.parent()).unwrap();
+                assert_eq!(
+                    app.world().get::<Text>(children[1]).unwrap().0,
+                    "2. Player - 7.50s"
+                );
+            }
+            let mut text = app.world_mut().query::<&Text>();
+            let lines: Vec<_> = text.iter(app.world()).map(|text| text.0.as_str()).collect();
+            assert_eq!(
+                lines.contains(&"Your time: 7.50s"),
+                recording != Recording::Recorded
+            );
+            if recording == Recording::Offline {
+                assert!(lines.iter().any(|text| text.contains("unranked")));
+            }
+            if matches!(recording, Recording::Failed(_)) {
+                assert!(lines.iter().any(|text| text.contains("Submit failed")));
+            }
+        }
+        let mut app = win_screen_app(Some("easy"), Recording::Recorded, Lookup::Ready);
+        let mut text = app.world_mut().query::<&Text>();
+        assert!(
+            text.iter(app.world())
+                .any(|text| text.0 == "Your time: 7.50s")
+        );
+    }
+
+    #[test]
+    fn recording_status_always_includes_finished_time() {
+        let online = Online::default();
+        for recording in [
+            Recording::Lost,
+            Recording::Custom,
+            Recording::Offline,
+            Recording::Pending,
+            Recording::Recorded,
+            Recording::Failed("Unavailable".into()),
+        ] {
+            assert!(
+                recording_text(&won_over(7500, recording), &online).starts_with("Score of 7.50s")
+            );
+        }
+        assert!(
+            recording_text(&won_over(7500, Recording::Offline), &online)
+                .contains("not recorded in offline mode")
+        );
+    }
+
+    #[test]
+    fn win_screen_does_not_show_stale_scores_while_loading_or_after_error() {
+        for lookup in [Lookup::Waiting, Lookup::Requested, Lookup::Unavailable] {
+            let mut app = win_screen_app(Some("intermediate"), Recording::Pending, lookup);
+            let mut text = app.world_mut().query::<&Text>();
+            let lines: Vec<_> = text.iter(app.world()).map(|text| text.0.as_str()).collect();
+            assert!(
+                !lines
+                    .iter()
+                    .any(|text| text.contains("Intermediate player"))
+            );
+            assert!(lines.contains(&"Your time: 7.50s"));
+            assert!(lines.contains(&if lookup == Lookup::Unavailable {
+                "Leaderboard unavailable."
+            } else {
+                "Loading leaderboard..."
+            }));
+        }
+    }
+
+    #[test]
+    fn custom_win_has_time_and_unranked_note_without_scoreboard() {
+        let mut app = win_screen_app(None, Recording::Custom, Lookup::NotApplicable);
+        let mut text = app.world_mut().query::<&Text>();
+        let lines: Vec<_> = text.iter(app.world()).map(|text| text.0.as_str()).collect();
+        assert!(lines.contains(&"Your time: 7.50s"));
+        assert!(
+            lines
+                .iter()
+                .any(|text| text.contains("custom games are unranked"))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|text| text.contains("Top 10") || text.contains("player"))
+        );
+    }
+
+    #[test]
+    fn win_screen_dismisses_on_click_or_escape_without_starting_another_game() {
+        let mut app = win_screen_app(None, Recording::Custom, Lookup::NotApplicable);
+        app.init_resource::<ButtonInput<MouseButton>>()
+            .add_systems(Update, (controls, dismiss_game_over_on_click).chain());
+        app.world_mut()
+            .spawn((Interaction::Pressed, Action::NewGame));
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.update();
+        assert!(app.world().resource::<Game>().game_over.is_none());
+        assert_eq!(app.world().resource::<Game>().board.status, Status::Won);
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<Entity, With<WinOverlay>>()
+                .iter(app.world())
+                .count(),
+            0
+        );
+        let mut app = shortcut_app(true, Status::Won);
+        app.world_mut().resource_mut::<Game>().game_over = Some(won_over(7500, Recording::Custom));
+        press_shortcut(&mut app, &[KeyCode::Escape]);
+        assert!(app.world().resource::<Game>().game_over.is_none());
+    }
+
+    #[test]
+    fn loss_picture_is_centered_over_dimming_but_below_ruru_without_modal_text() {
+        let mut game = Game::default();
+        game.board.status = Status::Lost;
+        finish_game(&mut game, 0);
+        let mut app = App::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        spawn_ruru(
+            &mut Commands::new(&mut queue, app.world()),
+            Handle::default(),
+        );
+        build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+        queue.apply(app.world_mut());
+        let mut query = app.world_mut().query_filtered::<
+            (&Node, &BackgroundColor, &GlobalZIndex, &Children),
+            With<LossOverlay>,
+        >();
+        let (node, color, z, children) = query.single(app.world()).unwrap();
+        assert_eq!(node.align_items, AlignItems::Center);
+        assert_eq!(node.justify_content, JustifyContent::Center);
+        assert_eq!(color.0.alpha(), 0.8);
+        let image = app.world().get::<ImageNode>(children[0]).unwrap();
+        assert_eq!(image.image, game.loss_image);
+        let loss_z = z.0;
+        let mut ruru = app
+            .world_mut()
+            .query_filtered::<&GlobalZIndex, With<RuruOverlay>>();
+        assert!(ruru.single(app.world()).unwrap().0 > loss_z);
+        let mut text = app.world_mut().query::<&Text>();
+        assert!(!text.iter(app.world()).any(|text| text.0 == "You lost"));
+    }
+
+    #[test]
+    fn loss_click_dismisses_without_changing_board_or_activating_controls() {
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            let mut app = App::new();
+            let mut game = Game::default();
+            game.board.status = Status::Lost;
+            finish_game(&mut game, 0);
+            app.insert_resource(game)
+                .init_resource::<ButtonInput<MouseButton>>()
+                .add_systems(Update, (controls, dismiss_game_over_on_click).chain());
+            app.world_mut()
+                .spawn((Interaction::Pressed, Action::Intermediate));
+            app.world_mut()
+                .resource_mut::<ButtonInput<MouseButton>>()
+                .press(button);
+            app.update();
+            let game = app.world().resource::<Game>();
+            assert!(game.game_over.is_none());
+            assert_eq!(game.board.status, Status::Lost);
+            assert_eq!(game.board.rows, 9);
+            assert_eq!(
+                app.world_mut()
+                    .query_filtered::<Entity, With<LossOverlay>>()
+                    .iter(app.world())
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn player_facing_text_uses_makibishi() {
+        for dialog in 0..4 {
+            let mut game = Game::default();
+            match dialog {
+                0 => game.help_open = true,
+                1 => game.custom_dialog = Some(custom::Settings::default()),
+                2 => game.quit_confirmation = true,
+                _ => {
+                    game.board.status = Status::Lost;
+                    finish_game(&mut game, 0);
+                }
+            }
+            let mut app = App::new();
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+            queue.apply(app.world_mut());
+            app.insert_resource(game)
+                .init_resource::<Time>()
+                .add_systems(Update, update_status);
+            app.update();
+            let mut query = app.world_mut().query::<&Text>();
+            for text in query.iter(app.world()) {
+                assert!(!text.0.to_lowercase().contains("mine"), "{}", text.0);
+            }
+            assert!(
+                query
+                    .iter(app.world())
+                    .any(|text| text.0.starts_with("Makibishi: 10"))
+            );
+        }
+    }
+
+    #[test]
+    fn ruru_status_message_lasts_through_travel_and_fade_then_restores() {
+        let mut app = App::new();
+        app.init_resource::<Game>()
+            .init_resource::<Time>()
+            .add_systems(Update, update_status);
+        let ruru_font = Assets::<Font>::default().add(Font {
+            data: std::sync::Arc::new(Vec::new()),
+        });
+        app.world_mut().resource_mut::<Game>().ruru_font = ruru_font.clone();
+        let message = app.world_mut().spawn((Text::new(""), GameMessage)).id();
+        app.update();
+        assert_eq!(app.world().get::<Text>(message).unwrap().0, "Good luck!");
+        app.world_mut()
+            .resource_mut::<Game>()
+            .ruru
+            .animation_started = Some(0.0);
+        for clock in [0.0, 3.0, 4.999] {
+            app.world_mut().resource_mut::<Game>().ruru.clock = clock;
+            app.update();
+            assert_eq!(
+                app.world().get::<Text>(message).unwrap().0,
+                "\u{30eb}\u{30eb} doesn't judge.."
+            );
+            assert_eq!(
+                app.world().get::<TextFont>(message).unwrap().font,
+                ruru_font
+            );
+        }
+        {
+            let mut game = app.world_mut().resource_mut::<Game>();
+            game.ruru.clock = 5.0;
+            game.board.status = Status::Lost;
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(message).unwrap().0,
+            "You stepped on a makibishi!"
+        );
+        assert_eq!(
+            app.world().get::<TextFont>(message).unwrap().font,
+            Handle::default()
+        );
+    }
+
+    #[test]
+    fn ruru_triggers_on_five_hits_in_an_inclusive_rolling_minute() {
+        let mut ruru = Ruru::default();
+        for clock in [0.0, 15.0, 30.0, 45.0] {
+            ruru.clock = clock;
+            ruru.record_mine_hit();
+            assert!(ruru.animation_started.is_none());
+        }
+        ruru.clock = 60.0;
+        ruru.record_mine_hit();
+        assert_eq!(ruru.animation_started, Some(60.0));
+        assert!(ruru.mine_hits.is_empty());
+
+        ruru.animation_started = None;
+        for clock in [70.0, 85.0, 100.0, 115.0, 130.001] {
+            ruru.clock = clock;
+            ruru.record_mine_hit();
+        }
+        assert!(ruru.animation_started.is_none());
+        assert_eq!(ruru.mine_hits.len(), 4);
+        ruru.clock = 131.0;
+        ruru.record_mine_hit();
+        assert_eq!(ruru.animation_started, Some(131.0));
+    }
+
+    #[test]
+    fn ruru_counts_offline_losses_across_new_games_not_flags_or_repeated_clicks() {
+        let mut game = Game::default();
+        for hit in 0..5 {
+            new_board(&mut game);
+            game.ruru.clock = f64::from(hit) * 10.0;
+            game.board.started = true;
+            game.board.cells[0].mine = true;
+            apply_move(&mut game, 1, "flag");
+            assert_eq!(game.ruru.mine_hits.len(), hit as usize);
+            apply_move(&mut game, 0, "reveal");
+            apply_move(&mut game, 0, "reveal");
+            assert_eq!(game.board.status, Status::Lost);
+        }
+        assert_eq!(game.ruru.animation_started, Some(40.0));
+        new_board(&mut game);
+        assert_eq!(game.ruru.animation_started, Some(40.0));
+    }
+
+    #[test]
+    fn ruru_counts_online_loss_once_even_when_board_is_refreshed() {
+        let mut game = Game::default();
+        let mut json = board_json(false);
+        json["status"] = "lost".into();
+        json["cells"][0]["mine"] = true.into();
+        json["cells"][0]["revealed"] = true.into();
+        for _ in 0..2 {
+            let view = serde_json::from_value(json.clone()).unwrap();
+            handle_online_reply(&mut game, Ok(Reply::Board(view)));
+        }
+        assert_eq!(game.ruru.mine_hits.len(), 1);
+    }
+
+    #[test]
+    fn ruru_moves_to_screen_center_then_fades_without_moving() {
+        let mut ruru = Ruru {
+            animation_started: Some(0.0),
+            ..default()
+        };
+        assert_eq!(ruru.frame(1200.0), Some((-68.0, 1.0)));
+        ruru.clock = 1.5;
+        assert_eq!(ruru.frame(1200.0), Some((249.0, 1.0)));
+        ruru.clock = 3.0;
+        assert_eq!(ruru.frame(1200.0), Some((566.0, 1.0)));
+        ruru.clock = 4.0;
+        assert_eq!(ruru.frame(1200.0), Some((566.0, 0.5)));
+        assert_eq!(ruru.frame(800.0), Some((366.0, 0.5)));
+        ruru.clock = 5.0;
+        assert_eq!(ruru.frame(1200.0), None);
+    }
+
+    #[test]
+    fn ruru_overlay_survives_screen_rebuild_and_updates_sprite_opacity() {
+        let mut app = App::new();
+        let mut game = Game::default();
+        game.ruru.animation_started = Some(0.0);
+        game.ruru.clock = 4.0;
+        app.insert_resource(game)
+            .init_resource::<Time<Real>>()
+            .add_systems(Update, update_ruru);
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        spawn_ruru(
+            &mut Commands::new(&mut queue, app.world()),
+            Handle::default(),
+        );
+        build_screen(
+            &mut Commands::new(&mut queue, app.world()),
+            app.world().resource::<Game>(),
+        );
+        queue.apply(app.world_mut());
+        let screens: Vec<_> = app
+            .world_mut()
+            .query_filtered::<Entity, With<Screen>>()
+            .iter(app.world())
+            .collect();
+        for entity in screens {
+            app.world_mut().despawn(entity);
+        }
+        app.update();
+        let mut overlays = app
+            .world_mut()
+            .query_filtered::<(&Node, &Visibility, &bevy::ui::FocusPolicy), With<RuruOverlay>>();
+        let (node, visibility, focus) = overlays.single(app.world()).unwrap();
+        assert_eq!(node.bottom, px(156));
+        assert_eq!(*visibility, Visibility::Inherited);
+        assert_eq!(*focus, bevy::ui::FocusPolicy::Pass);
+        let mut sprites = app
+            .world_mut()
+            .query_filtered::<(&Node, &ImageNode), With<RuruSprite>>();
+        let (node, image) = sprites.single(app.world()).unwrap();
+        assert_eq!(node.width, px(68));
+        assert_eq!(node.height, px(72));
+        assert_eq!(image.color.alpha(), 0.5);
+        app.world_mut().resource_mut::<Game>().ruru.clock = 5.0;
+        app.update();
+        assert_eq!(*overlays.single(app.world()).unwrap().1, Visibility::Hidden);
+    }
+
+    #[test]
+    fn chevrons_are_centered_just_outside_each_fade() {
+        assert_eq!(
+            board_chevron_center(BoardEdge::Top, Vec2::new(100.0, 8.0)),
+            Vec2::new(50.0, -4.5)
+        );
+        assert_eq!(
+            board_chevron_center(BoardEdge::Bottom, Vec2::new(100.0, 8.0)),
+            Vec2::new(50.0, 12.5)
+        );
+        assert_eq!(
+            board_chevron_center(BoardEdge::Left, Vec2::new(8.0, 100.0)),
+            Vec2::new(-4.5, 50.0)
+        );
+        assert_eq!(
+            board_chevron_center(BoardEdge::Right, Vec2::new(8.0, 100.0)),
+            Vec2::new(12.5, 50.0)
+        );
+        let center = Vec2::new(50.0, 50.0);
+        assert!(pointer_near_chevron(Some(center), center));
+        assert!(pointer_near_chevron(Some(center + Vec2::X * 24.0), center));
+        assert!(!pointer_near_chevron(Some(center + Vec2::X * 24.1), center));
+        assert!(!pointer_near_chevron(None, center));
+    }
+
+    #[test]
+    fn chevrons_rotate_east_facing_art_to_each_cardinal_direction() {
+        let mut app = App::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        build_screen(
+            &mut Commands::new(&mut queue, app.world()),
+            &Game::default(),
+        );
+        queue.apply(app.world_mut());
+        let mut query = app.world_mut().query::<(&BoardEdge, &Children)>();
+        assert_eq!(query.iter(app.world()).count(), 4);
+        for (edge, children) in query.iter(app.world()) {
+            let chevron = children[0];
+            assert!(app.world().get::<BoardChevron>(chevron).is_some());
+            assert!(app.world().get::<ImageNode>(chevron).is_some());
+            let rotation = app.world().get::<UiTransform>(chevron).unwrap().rotation;
+            let expected = match edge {
+                BoardEdge::Top => -90.0,
+                BoardEdge::Right => 0.0,
+                BoardEdge::Bottom => 90.0,
+                BoardEdge::Left => 180.0,
+            };
+            assert_eq!(rotation, Rot2::degrees(expected));
+        }
+    }
+
+    #[test]
+    fn clipped_board_edges_are_eight_pixels_inside_the_visible_board() {
+        let viewport = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let board = Rect::new(-20.0, -30.0, 120.0, 130.0);
+        for (edge, expected) in [
+            (BoardEdge::Top, Rect::new(0.0, 0.0, 100.0, 8.0)),
+            (BoardEdge::Right, Rect::new(92.0, 0.0, 100.0, 100.0)),
+            (BoardEdge::Bottom, Rect::new(0.0, 92.0, 100.0, 100.0)),
+            (BoardEdge::Left, Rect::new(0.0, 0.0, 8.0, 100.0)),
+        ] {
+            assert_eq!(board_edge_rect(edge, board, viewport), Some(expected));
+            assert_eq!(board_edge_rect(edge, viewport, viewport), None);
+        }
+        let board = Rect::new(20.0, -30.0, 80.0, 100.0);
+        assert_eq!(
+            board_edge_rect(BoardEdge::Top, board, viewport),
+            Some(Rect::new(20.0, 0.0, 80.0, 8.0))
+        );
+        assert_eq!(board_edge_rect(BoardEdge::Bottom, board, viewport), None);
+        assert_eq!(board_edge_rect(BoardEdge::Left, board, viewport), None);
+        assert_eq!(board_edge_rect(BoardEdge::Right, board, viewport), None);
+        assert_eq!(
+            board_edge_rect(
+                BoardEdge::Top,
+                Rect::new(0.0, -50.0, 100.0, -10.0),
+                viewport
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn board_edge_overlays_fade_from_half_black_to_transparent_and_pass_input() {
+        let mut app = App::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        build_screen(
+            &mut Commands::new(&mut queue, app.world()),
+            &Game::default(),
+        );
+        queue.apply(app.world_mut());
+        let mut query = app
+            .world_mut()
+            .query_filtered::<(&BackgroundGradient, &bevy::ui::FocusPolicy), With<BoardEdge>>();
+        assert_eq!(query.iter(app.world()).count(), 4);
+        for (gradient, focus) in query.iter(app.world()) {
+            assert_eq!(*focus, bevy::ui::FocusPolicy::Pass);
+            let Gradient::Linear(gradient) = &gradient.0[0] else {
+                panic!("Expected a linear edge fade");
+            };
+            assert_eq!(gradient.stops[0].color, Color::srgba(0.0, 0.0, 0.0, 0.5));
+            assert_eq!(gradient.stops[1].color, Color::srgba(0.0, 0.0, 0.0, 0.0));
+        }
+    }
 
     #[test]
     fn custom_settings_only_apply_on_new_game() {
@@ -1804,6 +3569,174 @@ mod tests {
             (24, 30, 100)
         );
         assert_eq!(game.elapsed, 0.0);
+    }
+
+    fn click_control(app: &mut App, action: Action) {
+        let entity = app.world_mut().spawn((Interaction::Pressed, action)).id();
+        app.update();
+        app.world_mut().despawn(entity);
+    }
+
+    #[test]
+    fn custom_modal_edits_are_isolated_until_start_and_reset_restores_defaults() {
+        let mut app = App::new();
+        app.init_resource::<Game>().add_systems(Update, controls);
+        {
+            let mut game = app.world_mut().resource_mut::<Game>();
+            game.custom_rows = 16;
+            game.custom_columns = 20;
+            game.custom_mines = 40;
+            game.board.started = true;
+            game.elapsed = 12.0;
+        }
+        click_control(&mut app, Action::Custom);
+        assert_eq!(
+            app.world().resource::<Game>().custom_dialog,
+            Some(custom::Settings {
+                rows: 16,
+                columns: 20,
+                mines: 40
+            })
+        );
+        click_control(&mut app, Action::Rows(1));
+        click_control(&mut app, Action::Advanced);
+        {
+            let game = app.world().resource::<Game>();
+            assert_eq!(game.board.rows, 9);
+            assert_eq!(game.custom_rows, 16);
+            assert_eq!(game.elapsed, 12.0);
+            assert!(game.board.started);
+        }
+        click_control(&mut app, Action::CloseCustom);
+        click_control(&mut app, Action::Custom);
+        assert_eq!(
+            app.world().resource::<Game>().custom_dialog.unwrap().rows,
+            16
+        );
+        click_control(&mut app, Action::ResetCustom);
+        assert_eq!(
+            app.world().resource::<Game>().custom_dialog,
+            Some(custom::Settings::default())
+        );
+        click_control(&mut app, Action::StartCustom);
+        let game = app.world().resource::<Game>();
+        assert_eq!(
+            (game.board.rows, game.board.columns, game.board.mines),
+            (10, 10, 15)
+        );
+        assert!(game.custom);
+        assert!(game.custom_dialog.is_none());
+        assert_eq!(game.elapsed, 0.0);
+    }
+
+    #[test]
+    fn custom_modal_clamps_dimensions_and_mines() {
+        let mut app = App::new();
+        app.init_resource::<Game>().add_systems(Update, controls);
+        click_control(&mut app, Action::Custom);
+        click_control(&mut app, Action::Rows(-100));
+        click_control(&mut app, Action::Columns(-100));
+        click_control(&mut app, Action::Mines(1000));
+        assert_eq!(
+            app.world().resource::<Game>().custom_dialog,
+            Some(custom::Settings {
+                rows: 5,
+                columns: 5,
+                mines: 24
+            })
+        );
+        click_control(&mut app, Action::Mines(-1000));
+        assert_eq!(
+            app.world().resource::<Game>().custom_dialog.unwrap().mines,
+            1
+        );
+    }
+
+    #[test]
+    fn custom_modal_blocks_game_shortcuts_and_escape_cancels() {
+        let mut app = shortcut_app(true, Status::Playing);
+        app.world_mut().resource_mut::<Game>().custom_dialog = Some(custom::Settings::default());
+        press_shortcut(
+            &mut app,
+            &[KeyCode::KeyN, KeyCode::KeyF, KeyCode::F2, KeyCode::F5],
+        );
+        let game = app.world().resource::<Game>();
+        assert!(game.board.started);
+        assert!(!game.flag_mode);
+        assert!(!game.zoomed);
+        assert!(!game.online.show_scores);
+        press_shortcut(&mut app, &[KeyCode::Escape]);
+        assert!(app.world().resource::<Game>().custom_dialog.is_none());
+        assert!(app.world().resource::<Game>().board.started);
+        app.world_mut().resource_mut::<Game>().custom_dialog = Some(custom::Settings::default());
+        press_shortcut(&mut app, &[KeyCode::Enter]);
+        assert!(app.world().resource::<Game>().custom);
+        assert_eq!(app.world().resource::<Game>().board.rows, 10);
+    }
+
+    #[test]
+    fn custom_start_persists_settings_and_reports_write_errors() {
+        let directory = std::env::temp_dir().join(format!(
+            "minesweeper-start-custom-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = directory.join("custom.json");
+        let settings = custom::Settings {
+            rows: 12,
+            columns: 14,
+            mines: 25,
+        };
+        let mut game = Game {
+            custom_dialog: Some(settings),
+            settings_path: Some(path.clone()),
+            ..default()
+        };
+        start_custom(&mut game);
+        assert_eq!(custom::load(&path).unwrap(), settings);
+        assert!(game.custom_dialog.is_none());
+        game.custom_dialog = Some(custom::Settings::default());
+        game.settings_path = Some(path.join("cannot-write.json"));
+        start_custom(&mut game);
+        assert!(game.settings_error.is_some());
+        assert!(game.custom_dialog.is_some());
+        assert_eq!(game.board.rows, 12);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn custom_modal_blocks_tile_interactions() {
+        let mut app = chord_app();
+        app.world_mut().resource_mut::<Game>().custom_dialog = Some(custom::Settings::default());
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Middle);
+        app.update();
+        assert_eq!(app.world().resource::<Game>().board.status, Status::Playing);
+        assert_eq!(
+            app.world_mut()
+                .query::<&TileFlash>()
+                .iter(app.world())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn f12_toggles_fullscreen() {
+        let mut app = shortcut_app(false, Status::Playing);
+        let window = app.world_mut().spawn(Window::default()).id();
+        press_shortcut(&mut app, &[KeyCode::F12]);
+        assert_eq!(
+            app.world().get::<Window>(window).unwrap().mode,
+            WindowMode::BorderlessFullscreen(MonitorSelection::Current)
+        );
+        press_shortcut(&mut app, &[KeyCode::Escape]);
+        assert_eq!(
+            app.world().get::<Window>(window).unwrap().mode,
+            WindowMode::Windowed
+        );
     }
 
     #[test]
@@ -2017,6 +3950,19 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ruru_font_contains_japanese_and_english_message_glyphs() {
+        let font = windows_font("YuGothR.ttc").unwrap();
+        let face = ttf_parser::Face::parse(&font.data, 0).unwrap();
+        for character in "\u{30eb}\u{30eb} doesn't judge..".chars() {
+            assert!(
+                face.glyph_index(character).is_some(),
+                "Missing glyph for {character}"
+            );
+        }
+    }
+
     #[test]
     fn request_status_keeps_a_fixed_slot_and_hides_refresh_during_move() {
         let (online, worker) = online::tests::starting_online();
@@ -2044,8 +3990,8 @@ mod tests {
                 .query_filtered::<&Node, With<NetworkStatusSlot>>()
                 .single(app.world())
                 .unwrap();
-            assert_eq!(slot.height, px(84));
-            assert_eq!(slot.min_height, px(84));
+            assert_eq!(slot.height, px(80));
+            assert_eq!(slot.min_height, px(80));
             assert_eq!(slot.flex_shrink, 0.0);
             assert_eq!(slot.position_type, PositionType::Absolute);
             assert_eq!(slot.bottom, px(0));
@@ -2160,8 +4106,164 @@ mod tests {
             .iter(app.world())
             .map(|t| t.0.clone())
             .collect();
-        assert!(labels.iter().any(|text| text == "> Password: ************"));
+        assert!(labels.iter().any(|text| text == "************"));
         assert!(labels.iter().all(|text| !text.contains("test-passwor")));
+    }
+
+    #[test]
+    fn login_is_a_black_modal_over_the_board_with_disabled_empty_submit() {
+        let mut game = Game::default();
+        game.online.login_open = true;
+        game.online.message = "Invalid username or password.".into();
+        let mut app = App::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+        queue.apply(app.world_mut());
+        let dialog = app
+            .world_mut()
+            .query_filtered::<Entity, With<LoginDialog>>()
+            .single(app.world())
+            .unwrap();
+        assert_eq!(app.world().get::<GlobalZIndex>(dialog).unwrap().0, 20);
+        let card = app.world().get::<Children>(dialog).unwrap()[0];
+        assert_eq!(
+            app.world().get::<BackgroundColor>(card).unwrap().0,
+            Color::BLACK
+        );
+        assert!(app.world().get::<BorderRadius>(card).is_some());
+        assert_eq!(
+            app.world_mut().query::<&Tile>().iter(app.world()).count(),
+            81
+        );
+        assert!(
+            !app.world_mut()
+                .query::<&Action>()
+                .iter(app.world())
+                .any(|action| matches!(action, Action::SignIn))
+        );
+        assert!(
+            app.world_mut()
+                .query::<&Text>()
+                .iter(app.world())
+                .any(|text| text.0 == "Invalid username or password.")
+        );
+    }
+
+    #[test]
+    fn login_fields_focus_remember_and_cancel_preserve_board() {
+        let mut game = Game::default();
+        game.online.login_open = true;
+        game.online.username = "Player".into();
+        game.online.password = "secret".into();
+        game.board.flag(0);
+        let mut app = App::new();
+        app.insert_resource(game).add_systems(Update, controls);
+        click_control(&mut app, Action::Password);
+        assert!(app.world().resource::<Game>().online.password_focus);
+        click_control(&mut app, Action::Username);
+        assert!(!app.world().resource::<Game>().online.password_focus);
+        click_control(&mut app, Action::Remember);
+        assert!(app.world().resource::<Game>().online.remember);
+        click_control(&mut app, Action::Advanced);
+        assert_eq!(app.world().resource::<Game>().board.rows, 9);
+        click_control(&mut app, Action::CancelLogin);
+        let game = app.world().resource::<Game>();
+        assert!(!game.online.login_open);
+        assert!(game.online.password.is_empty());
+        assert!(game.board.cells[0].flagged);
+    }
+
+    #[test]
+    fn filled_login_enables_submit_and_masks_password() {
+        let mut game = Game::default();
+        game.online.login_open = true;
+        game.online.username = "Player".into();
+        game.online.password = "secret".into();
+        game.online.password_focus = true;
+        let mut app = App::new();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+        queue.apply(app.world_mut());
+        assert!(
+            app.world_mut()
+                .query::<&Action>()
+                .iter(app.world())
+                .any(|action| matches!(action, Action::SignIn))
+        );
+        assert!(
+            app.world_mut()
+                .query::<&Text>()
+                .iter(app.world())
+                .any(|text| text.0 == "******")
+        );
+        assert!(
+            !app.world_mut()
+                .query::<&Text>()
+                .iter(app.world())
+                .any(|text| text.0.contains("secret"))
+        );
+        let mut query = app.world_mut().query::<(&Action, &BorderColor)>();
+        let (_, border) = query
+            .iter(app.world())
+            .find(|(action, _)| matches!(action, Action::Password))
+            .unwrap();
+        assert_eq!(*border, BorderColor::all(Color::WHITE));
+    }
+
+    #[test]
+    fn remembered_login_checkmark_uses_geometry_instead_of_a_font() {
+        for remember in [false, true] {
+            let mut game = Game::default();
+            game.online.login_open = true;
+            game.online.remember = remember;
+            let mut app = App::new();
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+            queue.apply(app.world_mut());
+            let mut query = app
+                .world_mut()
+                .query::<(&Node, &UiTransform, &BorderColor)>();
+            let marks = query
+                .iter(app.world())
+                .filter(|(node, transform, color)| {
+                    node.width == px(8)
+                        && node.height == px(16)
+                        && node.border.right == px(3)
+                        && node.border.bottom == px(3)
+                        && transform.rotation == Rot2::degrees(45.0)
+                        && **color == BorderColor::all(Color::WHITE)
+                })
+                .count();
+            assert_eq!(marks, usize::from(remember));
+        }
+    }
+
+    #[test]
+    fn login_blocks_function_shortcuts_and_escape_clears_password() {
+        let mut app = shortcut_app(true, Status::Playing);
+        {
+            let mut game = app.world_mut().resource_mut::<Game>();
+            game.online.login_open = true;
+            game.online.password = "secret".into();
+        }
+        press_shortcut(&mut app, &[KeyCode::F1, KeyCode::F2, KeyCode::F5]);
+        let game = app.world().resource::<Game>();
+        assert!(!game.help_open);
+        assert!(!game.online.show_scores);
+        assert!(!game.zoomed);
+        app.add_message::<KeyboardInput>()
+            .add_systems(Update, login_input);
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::Escape,
+            logical_key: Key::Escape,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+        assert!(!app.world().resource::<Game>().online.login_open);
+        assert!(app.world().resource::<Game>().online.password.is_empty());
     }
 
     #[test]
@@ -2187,7 +4289,10 @@ mod tests {
         queue.apply(app.world_mut());
 
         let mut query = app.world_mut().query::<(&ImageNode, &Node)>();
-        let (image, node) = query.single(app.world()).unwrap();
+        let (image, node) = query
+            .iter(app.world())
+            .find(|(image, _)| image.image == game.banner)
+            .unwrap();
         assert_eq!(image.image, game.banner);
         assert_eq!(node.width, percent(100));
         assert_eq!(node.max_width, px(1269));
@@ -2348,7 +4453,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_and_controls_are_children_of_bottom_status_bar() {
+    fn stats_and_difficulty_controls_are_above_the_black_status_bar() {
         let mut app = App::new();
         let game = Game::default();
         let mut queue = bevy::ecs::world::CommandQueue::default();
@@ -2365,15 +4470,106 @@ mod tests {
             .single(app.world())
             .unwrap();
         let row = app.world().get::<ChildOf>(stats).unwrap().parent();
-        assert_eq!(app.world().get::<ChildOf>(row).unwrap().parent(), status);
+        let controls = app
+            .world_mut()
+            .query_filtered::<Entity, With<GameControls>>()
+            .single(app.world())
+            .unwrap();
+        assert_eq!(app.world().get::<ChildOf>(row).unwrap().parent(), controls);
+        assert_eq!(
+            app.world().get::<BackgroundColor>(status).unwrap().0,
+            Color::BLACK
+        );
         for (entity, action) in app
             .world_mut()
             .query::<(Entity, &Action)>()
             .iter(app.world())
         {
-            if matches!(action, Action::FlagMode | Action::Fullscreen) {
-                assert_eq!(app.world().get::<ChildOf>(entity).unwrap().parent(), row);
+            let parent = app.world().get::<ChildOf>(entity).unwrap().parent();
+            if matches!(
+                action,
+                Action::FlagMode | Action::Fullscreen | Action::Scores
+            ) {
+                assert_eq!(app.world().get::<ChildOf>(parent).unwrap().parent(), status);
+            } else if matches!(
+                action,
+                Action::Beginner
+                    | Action::Intermediate
+                    | Action::Advanced
+                    | Action::Custom
+                    | Action::NewGame
+            ) {
+                assert_eq!(
+                    app.world().get::<ChildOf>(parent).unwrap().parent(),
+                    controls
+                );
             }
+        }
+    }
+
+    #[test]
+    fn header_and_footer_distinguish_ranked_and_offline_games() {
+        for (signed_in, custom) in [(false, false), (true, false), (true, true)] {
+            let mut game = Game {
+                custom,
+                ..default()
+            };
+            if signed_in {
+                game.online.session = Some(online::Session {
+                    token: "b".repeat(64),
+                    display_name: "Player".into(),
+                });
+                game.online.ranked = true;
+                game.online.game_id = Some("00000000-0000-0000-0000-000000000000".into());
+            }
+            let ranked = signed_in && !custom;
+            let mut app = App::new();
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            build_screen(&mut Commands::new(&mut queue, app.world()), &game);
+            queue.apply(app.world_mut());
+            let mut query = app
+                .world_mut()
+                .query::<(&Text, &TextColor, Option<&Node>)>();
+            let (header, color, node) = query
+                .iter(app.world())
+                .find(|(text, _, _)| {
+                    text.0
+                        == if ranked {
+                            "Online as Player"
+                        } else {
+                            "Offline"
+                        }
+                })
+                .unwrap();
+            assert!(!header.0.is_empty());
+            assert_eq!(
+                color.0,
+                if ranked {
+                    Color::WHITE
+                } else {
+                    number_color(3)
+                }
+            );
+            assert_eq!(node.unwrap().align_self, AlignSelf::End);
+            let (_, color, _) = query
+                .iter(app.world())
+                .find(|(text, _, _)| {
+                    text.0
+                        == if ranked {
+                            "Online ranked mode"
+                        } else {
+                            "Offline unranked"
+                        }
+                })
+                .unwrap();
+            assert_eq!(
+                color.0,
+                if ranked {
+                    Color::WHITE
+                } else {
+                    number_color(3)
+                }
+            );
         }
     }
 
@@ -2601,7 +4797,10 @@ mod tests {
             apply_move(&mut game, 3, "reveal");
             let over = game.game_over.as_ref().unwrap();
             assert!(!over.won);
-            assert_eq!(over.reason, "You revealed a mine at row 2, column 2.");
+            assert_eq!(
+                over.reason,
+                "You stepped on a makibishi at row 2, column 2!"
+            );
             assert_eq!(over.elapsed_ms, 4250);
             assert_eq!(over.recording, Recording::Lost);
             assert_eq!(over.lookup, Lookup::NotApplicable);
@@ -2628,7 +4827,7 @@ mod tests {
         let over = game.game_over.as_ref().unwrap();
         assert_eq!(
             over.reason,
-            "Chording row 2, column 2 opened a mine - a flag was misplaced."
+            "Chording row 2, column 2 revealed a makibishi - a flag was misplaced."
         );
     }
 
@@ -2748,7 +4947,10 @@ mod tests {
         let over = game.game_over.as_ref().unwrap();
         assert_eq!(over.recording, Recording::Recorded);
         assert_eq!(over.lookup, Lookup::Ready);
-        assert_eq!(recording_text(over, &game.online), "Score recorded online.");
+        assert_eq!(
+            recording_text(over, &game.online),
+            "Score of 7.50s recorded online."
+        );
         assert_eq!(
             placement_text(over, &game.online),
             "Leaderboard: #2 on Beginner."
