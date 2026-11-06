@@ -5,12 +5,24 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.17", default-features = false, features = ["std", "async_executor", "bevy_winit", "bevy_ui_render", "bevy_audio", "default_font", "multi_threaded", "png", "vorbis", "x11"] }
+bevy = { version = "0.17", default-features = false, features = ["std", "async_executor", "bevy_winit", "bevy_ui_render", "bevy_audio", "default_font", "png", "vorbis"] }
 rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "0.17", default-features = false, features = ["multi_threaded", "x11"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
 keyring = { version = "3", features = ["windows-native"] }
+webbrowser = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.17", default-features = false, features = ["webgl2"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Location", "Storage"] }
 
 [target.'cfg(windows)'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

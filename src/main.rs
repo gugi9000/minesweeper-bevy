@@ -12,6 +12,7 @@ use bevy::{
 };
 use board::{Board, Status};
 use online::{Online, Operation, Reply};
+use rand::prelude::IndexedRandom;
 
 #[derive(Resource)]
 struct Game {
@@ -32,6 +33,11 @@ struct Game {
     board_scroll: Vec2,
     last_move: Option<(usize, &'static str)>,
     triggered_mine: Option<usize>,
+    auto_solver: bool,
+    auto_solver_board: bool,
+    auto_solver_idle: f32,
+    auto_solver_step: f32,
+    auto_solver_restart: Option<f32>,
     game_over: Option<GameOver>,
     connection: Option<ConnectionLost>,
     tile_images: Option<TileImages>,
@@ -82,6 +88,13 @@ const RURU_WIDTH: f32 = 68.0;
 const RURU_HEIGHT: f32 = 72.0;
 const RURU_TRAVEL_SECONDS: f64 = 3.0;
 const RURU_FADE_SECONDS: f64 = 2.0;
+const AUTO_SOLVER_IDLE_SECONDS: f32 = 20.0;
+const AUTO_SOLVER_RESTART_SECONDS: f32 = 5.0;
+const AUTO_SOLVER_BOARD_CHOICES: [(bool, (usize, usize, usize)); 3] = [
+    (false, (9, 9, 10)),
+    (false, (16, 16, 40)),
+    (true, (16, 30, 99)),
+];
 
 #[derive(Default)]
 struct Ruru {
@@ -213,6 +226,11 @@ impl Default for Game {
             board_scroll: Vec2::ZERO,
             last_move: None,
             triggered_mine: None,
+            auto_solver: false,
+            auto_solver_board: false,
+            auto_solver_idle: 0.0,
+            auto_solver_step: 0.0,
+            auto_solver_restart: None,
             game_over: None,
             connection: None,
             tile_images: None,
@@ -255,6 +273,12 @@ struct TriggeredMineHighlight;
 struct WinOverlay;
 #[derive(Component)]
 struct WinningScore;
+#[derive(Component)]
+struct ScoreLink(i32);
+#[derive(Component)]
+struct ScorePreview;
+#[derive(Component)]
+struct ScoreViewport;
 #[derive(Component)]
 struct LoginDialog;
 #[derive(Component)]
@@ -309,15 +333,9 @@ enum Action {
 #[derive(Component)]
 struct RetryText;
 
-
-fn play_intro(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
+fn play_intro(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn((
-        AudioPlayer::new(
-            asset_server.load("sfx/makibishi_intro.ogg")
-        ),
+        AudioPlayer::new(asset_server.load("sfx/makibishi_intro.ogg")),
         PlaybackSettings::DESPAWN,
     ));
 }
@@ -327,7 +345,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.add_plugins(
         DefaultPlugins
             .set(AssetPlugin {
+                #[cfg(not(target_arch = "wasm32"))]
                 file_path: env!("CARGO_MANIFEST_DIR").into(),
+                #[cfg(target_arch = "wasm32")]
+                file_path: "/static/makibishi".into(),
+                #[cfg(target_arch = "wasm32")]
+                meta_check: bevy::asset::AssetMetaCheck::Never,
                 ..default()
             })
             .set(ImagePlugin::default_nearest())
@@ -335,6 +358,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 primary_window: Some(Window {
                     title: "Makibishi".into(),
                     resolution: (1200, 950).into(),
+                    #[cfg(target_arch = "wasm32")]
+                    canvas: Some("#makibishi-canvas".into()),
+                    #[cfg(target_arch = "wasm32")]
+                    fit_canvas_to_parent: true,
+                    #[cfg(target_arch = "wasm32")]
+                    prevent_default_event_handling: true,
                     ..default()
                 }),
                 ..default()
@@ -353,15 +382,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (
             update_ruru,
             login_input,
+            interrupt_auto_solver,
             keyboard,
             controls,
+            open_score_links,
             dismiss_game_over_on_click,
             tiles,
+            run_auto_solver,
             update_flashes,
             poll_online,
             retry_connection,
             update_status,
             scroll_board,
+            scroll_scores,
         )
             .chain(),
     );
@@ -376,9 +409,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ruru_font = fonts.add(japanese_font);
         app.world_mut().resource_mut::<Game>().ruru_font = ruru_font;
     }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let font = Font::try_from_bytes(WEB_FONT.to_vec())
+            .map_err(|error| format!("Cannot load embedded web font: {error}"))?;
+        let mut fonts = app.world_mut().resource_mut::<Assets<Font>>();
+        fonts.insert(bevy::asset::AssetId::default(), font)?;
+        // The default handle now covers Danish and Japanese text, so Ruru can share it.
+        app.world_mut().resource_mut::<Game>().ruru_font = Handle::default();
+    }
     app.run();
     Ok(())
 }
+
+/// Noto Sans JP subset (SIL OFL 1.1, see assets/fonts/OFL.txt) covering Latin-1, punctuation and kana.
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_FONT: &[u8] = include_bytes!("../assets/fonts/MakibishiWeb.ttf");
 
 #[cfg(target_os = "windows")]
 fn windows_ui_font() -> Result<Font, Box<dyn std::error::Error>> {
@@ -556,6 +602,100 @@ fn footer_button(parent: &mut ChildSpawnerCommands, text: &str, action: Action, 
         .with_children(|parent| {
             parent.spawn(colored_label(text, 14.0, color));
         });
+}
+
+fn score_preview(parent: &mut ChildSpawnerCommands, board: &online::WinningBoard) {
+    parent
+        .spawn((
+            ScorePreview,
+            Node {
+                display: Display::Grid,
+                grid_template_columns: vec![GridTrack::px(3.0); board.columns],
+                grid_template_rows: vec![GridTrack::px(3.0); board.rows],
+                flex_shrink: 0.0,
+                ..default()
+            },
+            bevy::ui::FocusPolicy::Pass,
+        ))
+        .with_children(|preview| {
+            for cell in &board.cells {
+                let color = if cell.mine {
+                    if cell.flagged {
+                        Color::srgb(0.9, 0.65, 0.2)
+                    } else {
+                        Color::srgb(0.7, 0.16, 0.18)
+                    }
+                } else if cell.count > 0 {
+                    number_color(cell.count)
+                } else {
+                    Color::srgb(0.12, 0.17, 0.23)
+                };
+                preview.spawn((
+                    Node {
+                        width: px(3),
+                        height: px(3),
+                        ..default()
+                    },
+                    BackgroundColor(color),
+                    bevy::ui::FocusPolicy::Pass,
+                ));
+            }
+        });
+}
+
+fn score_row(
+    parent: &mut ChildSpawnerCommands,
+    game: &Game,
+    rank: usize,
+    score: &online::Score,
+    font_size: f32,
+    selected: Option<bool>,
+) {
+    let mut row = parent.spawn(Node {
+        width: percent(100),
+        padding: UiRect::all(px(6)),
+        align_items: AlignItems::Center,
+        column_gap: px(8),
+        flex_shrink: 0.0,
+        ..default()
+    });
+    if let Some(id) = score.id {
+        row.insert((Button, ScoreLink(id)));
+    }
+    row.with_children(|row| {
+        if let Some(selected) = selected {
+            let mut marker = row.spawn((
+                Node {
+                    width: px(9),
+                    height: px(14),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+                ImageNode::new(game.chevron.clone()),
+                if selected {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                },
+            ));
+            if selected {
+                marker.insert(WinningScore);
+            }
+        }
+        if let Some(board) = &score.board {
+            score_preview(row, board);
+        }
+        row.spawn(label(
+            format!(
+                "{}. {}{} - {:.2}s",
+                rank + 1,
+                score.player_name,
+                if score.user_id.is_none() { " *" } else { "" },
+                score.elapsed_ms as f64 / 1000.0
+            ),
+            font_size,
+        ));
+    });
 }
 
 fn ranked_game(game: &Game) -> bool {
@@ -1251,274 +1391,281 @@ fn build_screen(commands: &mut Commands, game: &Game) {
                     });
             });
     }
-    commands
-        .spawn((
-            Screen,
+    let mut content = commands.spawn((
+        Screen,
+        Node {
+            width: percent(100),
+            height: percent(100),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            row_gap: px(12),
+            padding: UiRect {
+                bottom: px(168),
+                ..UiRect::all(px(16))
+            },
+            overflow: Overflow::scroll_y(),
+            ..default()
+        },
+    ));
+    if game.online.show_scores {
+        content.insert((ScoreViewport, ScrollPosition::default()));
+    }
+    content.with_children(|parent| {
+        parent.spawn((
+            ImageNode::new(game.banner.clone()),
             Node {
                 width: percent(100),
-                height: percent(100),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                row_gap: px(12),
-                padding: UiRect {
-                    bottom: px(168),
-                    ..UiRect::all(px(16))
-                },
-                overflow: Overflow::scroll_y(),
+                max_width: px(1269),
+                aspect_ratio: Some(1269.0 / 249.0),
+                flex_shrink: 0.0,
                 ..default()
             },
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                ImageNode::new(game.banner.clone()),
-                Node {
-                    width: percent(100),
-                    max_width: px(1269),
-                    aspect_ratio: Some(1269.0 / 249.0),
-                    flex_shrink: 0.0,
-                    ..default()
+        ));
+        let account = if ranked_game(game) {
+            game.online
+                .session
+                .as_ref()
+                .map_or("Online".to_string(), |session| {
+                    format!("Online as {}", session.display_name)
+                })
+        } else {
+            "Offline".to_string()
+        };
+        parent.spawn((
+            colored_label(
+                account,
+                16.0,
+                if ranked_game(game) {
+                    Color::WHITE
+                } else {
+                    number_color(3)
                 },
+            ),
+            Node {
+                align_self: AlignSelf::End,
+                ..default()
+            },
+        ));
+        if game.online.show_scores {
+            parent.spawn(label(
+                "Top 10 server-managed games per difficulty (* = guest account not verified)",
+                18.0,
             ));
-            let account = if ranked_game(game) {
-                game.online
-                    .session
-                    .as_ref()
-                    .map_or("Online".to_string(), |session| {
-                        format!("Online as {}", session.display_name)
-                    })
-            } else {
-                "Offline".to_string()
-            };
-            parent.spawn((
-                colored_label(
-                    account,
-                    16.0,
-                    if ranked_game(game) {
-                        Color::WHITE
-                    } else {
-                        number_color(3)
-                    },
-                ),
-                Node {
-                    align_self: AlignSelf::End,
-                    ..default()
-                },
-            ));
-            if game.online.show_scores {
+            if [
+                &game.online.scores.easy,
+                &game.online.scores.intermediate,
+                &game.online.scores.advanced,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|score| score.id.is_some())
+            {
                 parent.spawn(label(
-                    "Top 10 server-managed games per difficulty (* = guest account not verified)",
-                    18.0,
+                    "Click a score to view its winning board on the website.",
+                    14.0,
                 ));
-                parent
-                    .spawn(Node {
-                        column_gap: px(30),
-                        ..default()
-                    })
-                    .with_children(|parent| {
-                        for (title, scores) in [
-                            ("Beginner", &game.online.scores.easy),
-                            ("Intermediate", &game.online.scores.intermediate),
-                            ("Advanced", &game.online.scores.advanced),
-                        ] {
-                            parent
-                                .spawn(Node {
-                                    flex_direction: FlexDirection::Column,
-                                    row_gap: px(8),
-                                    ..default()
-                                })
-                                .with_children(|parent| {
-                                    parent.spawn(label(title, 22.0));
-                                    if !game.online.scores_loaded {
-                                        parent.spawn(label("Scores have not loaded.", 16.0));
-                                    } else if scores.is_empty() {
-                                        parent.spawn(label("No scores yet.", 16.0));
-                                    }
-                                    for (rank, score) in scores.iter().take(10).enumerate() {
-                                        parent.spawn(label(
-                                            format!(
-                                                "{}. {}{} - {:.2}s",
-                                                rank + 1,
-                                                score.player_name,
-                                                if score.user_id.is_none() { " *" } else { "" },
-                                                score.elapsed_ms as f64 / 1000.0
-                                            ),
-                                            16.0,
-                                        ));
-                                    }
-                                });
-                        }
-                    });
-                button(parent, "Back to game", Action::BackToGame);
-                return;
-            }
-            let scale = if game.zoomed { 2.0 } else { 1.0 };
-            let tile_size = board_tile_size(game);
-            for edge in [
-                BoardEdge::Top,
-                BoardEdge::Right,
-                BoardEdge::Bottom,
-                BoardEdge::Left,
-            ] {
-                let angle = match edge {
-                    BoardEdge::Top => LinearGradient::TO_BOTTOM,
-                    BoardEdge::Right => LinearGradient::TO_LEFT,
-                    BoardEdge::Bottom => LinearGradient::TO_TOP,
-                    BoardEdge::Left => LinearGradient::TO_RIGHT,
-                };
-                let rotation = match edge {
-                    BoardEdge::Top => -90.0,
-                    BoardEdge::Right => 0.0,
-                    BoardEdge::Bottom => 90.0,
-                    BoardEdge::Left => 180.0,
-                };
-                parent
-                    .commands()
-                    .spawn((
-                        Screen,
-                        edge,
-                        Node {
-                            position_type: PositionType::Absolute,
-                            display: Display::None,
-                            ..default()
-                        },
-                        BackgroundGradient::from(LinearGradient::new(
-                            angle,
-                            vec![
-                                ColorStop::new(Color::srgba(0.0, 0.0, 0.0, 0.5), percent(0)),
-                                ColorStop::new(Color::srgba(0.0, 0.0, 0.0, 0.0), percent(100)),
-                            ],
-                        )),
-                        bevy::ui::FocusPolicy::Pass,
-                        GlobalZIndex(5),
-                    ))
-                    .with_children(|parent| {
-                        parent.spawn((
-                            BoardChevron,
-                            ImageNode::new(game.chevron.clone()),
-                            Node {
-                                position_type: PositionType::Absolute,
-                                width: px(9),
-                                height: px(14),
-                                ..default()
-                            },
-                            UiTransform::from_rotation(Rot2::degrees(rotation)),
-                            bevy::ui::FocusPolicy::Pass,
-                        ));
-                    });
             }
             parent
+                .spawn(Node {
+                    column_gap: px(30),
+                    ..default()
+                })
+                .with_children(|parent| {
+                    for (title, scores) in [
+                        ("Beginner", &game.online.scores.easy),
+                        ("Intermediate", &game.online.scores.intermediate),
+                        ("Advanced", &game.online.scores.advanced),
+                    ] {
+                        parent
+                            .spawn(Node {
+                                flex_direction: FlexDirection::Column,
+                                row_gap: px(8),
+                                ..default()
+                            })
+                            .with_children(|parent| {
+                                parent.spawn(label(title, 22.0));
+                                if !game.online.scores_loaded {
+                                    parent.spawn(label("Scores have not loaded.", 16.0));
+                                } else if scores.is_empty() {
+                                    parent.spawn(label("No scores yet.", 16.0));
+                                }
+                                for (rank, score) in scores.iter().take(10).enumerate() {
+                                    score_row(parent, game, rank, score, 16.0, None);
+                                }
+                            });
+                    }
+                });
+            button(parent, "Back to game", Action::BackToGame);
+            return;
+        }
+        let scale = if game.zoomed { 2.0 } else { 1.0 };
+        let tile_size = board_tile_size(game);
+        for edge in [
+            BoardEdge::Top,
+            BoardEdge::Right,
+            BoardEdge::Bottom,
+            BoardEdge::Left,
+        ] {
+            let angle = match edge {
+                BoardEdge::Top => LinearGradient::TO_BOTTOM,
+                BoardEdge::Right => LinearGradient::TO_LEFT,
+                BoardEdge::Bottom => LinearGradient::TO_TOP,
+                BoardEdge::Left => LinearGradient::TO_RIGHT,
+            };
+            let rotation = match edge {
+                BoardEdge::Top => -90.0,
+                BoardEdge::Right => 0.0,
+                BoardEdge::Bottom => 90.0,
+                BoardEdge::Left => 180.0,
+            };
+            parent
+                .commands()
                 .spawn((
-                    BoardViewport,
-                    ScrollPosition(game.board_scroll),
+                    Screen,
+                    edge,
                     Node {
-                        width: percent(100),
-                        flex_grow: 1.0,
-                        min_height: px(0),
-                        overflow: Overflow::scroll(),
+                        position_type: PositionType::Absolute,
+                        display: Display::None,
                         ..default()
                     },
+                    BackgroundGradient::from(LinearGradient::new(
+                        angle,
+                        vec![
+                            ColorStop::new(Color::srgba(0.0, 0.0, 0.0, 0.5), percent(0)),
+                            ColorStop::new(Color::srgba(0.0, 0.0, 0.0, 0.0), percent(100)),
+                        ],
+                    )),
+                    bevy::ui::FocusPolicy::Pass,
+                    GlobalZIndex(5),
                 ))
                 .with_children(|parent| {
-                    parent
-                        .spawn((
-                            BoardGrid,
-                            Node {
-                                display: Display::Grid,
-                                grid_template_columns: vec![
-                                    GridTrack::px(tile_size);
-                                    game.board.columns
-                                ],
-                                grid_template_rows: vec![GridTrack::px(tile_size); game.board.rows],
-                                column_gap: px(2.0 * scale),
-                                row_gap: px(2.0 * scale),
-                                margin: UiRect::all(Val::Auto),
-                                flex_shrink: 0.0,
-                                ..default()
-                            },
-                        ))
-                        .with_children(|parent| {
-                            for (index, cell) in game.board.cells.iter().enumerate() {
-                                let show_mine = cell.mine
-                                    && (cell.revealed || game.board.status == Status::Lost);
-                                let image = game.tile_images.as_ref().and_then(|images| {
-                                    if show_mine {
-                                        Some(images.mine.clone())
-                                    } else if cell.flagged {
-                                        Some(images.flagged.clone())
-                                    } else if !cell.revealed {
-                                        let row = (index / game.board.columns) as u32;
-                                        let col = (index % game.board.columns) as u32;
-                                        Some(images.covered[tile_variant(row, col)].clone())
-                                    } else {
-                                        None
-                                    }
-                                });
-                                let text = if image.is_some() {
-                                    String::new()
-                                } else if show_mine {
-                                    "*".into()
+                    parent.spawn((
+                        BoardChevron,
+                        ImageNode::new(game.chevron.clone()),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            width: px(9),
+                            height: px(14),
+                            ..default()
+                        },
+                        UiTransform::from_rotation(Rot2::degrees(rotation)),
+                        bevy::ui::FocusPolicy::Pass,
+                    ));
+                });
+        }
+        parent
+            .spawn((
+                BoardViewport,
+                ScrollPosition(game.board_scroll),
+                Node {
+                    width: percent(100),
+                    flex_grow: 1.0,
+                    min_height: px(0),
+                    overflow: Overflow::scroll(),
+                    ..default()
+                },
+            ))
+            .with_children(|parent| {
+                parent
+                    .spawn((
+                        BoardGrid,
+                        Node {
+                            display: Display::Grid,
+                            grid_template_columns: vec![
+                                GridTrack::px(tile_size);
+                                game.board.columns
+                            ],
+                            grid_template_rows: vec![GridTrack::px(tile_size); game.board.rows],
+                            column_gap: px(2.0 * scale),
+                            row_gap: px(2.0 * scale),
+                            margin: UiRect::all(Val::Auto),
+                            flex_shrink: 0.0,
+                            ..default()
+                        },
+                    ))
+                    .with_children(|parent| {
+                        for (index, cell) in game.board.cells.iter().enumerate() {
+                            let show_mine =
+                                cell.mine && (cell.revealed || game.board.status == Status::Lost);
+                            let image = game.tile_images.as_ref().and_then(|images| {
+                                if show_mine {
+                                    Some(images.mine.clone())
                                 } else if cell.flagged {
-                                    "F".into()
-                                } else if cell.revealed && cell.count > 0 {
-                                    cell.count.to_string()
+                                    Some(images.flagged.clone())
+                                } else if !cell.revealed {
+                                    let row = (index / game.board.columns) as u32;
+                                    let col = (index % game.board.columns) as u32;
+                                    Some(images.covered[tile_variant(row, col)].clone())
                                 } else {
-                                    String::new()
-                                };
-                                let color = if show_mine {
-                                    Color::srgb(0.7, 0.16, 0.18)
-                                } else if cell.revealed {
-                                    Color::srgb(0.12, 0.17, 0.23)
-                                } else if cell.flagged {
-                                    Color::srgb(0.52, 0.36, 0.12)
-                                } else {
-                                    Color::srgb(0.26, 0.34, 0.43)
-                                };
-                                let mut tile = parent.spawn((
-                                    Button,
-                                    Tile(index),
-                                    Node {
-                                        width: px(tile_size),
-                                        height: px(tile_size),
-                                        align_items: AlignItems::Center,
-                                        justify_content: JustifyContent::Center,
-                                        ..default()
-                                    },
-                                    BackgroundColor(color),
-                                ));
-                                if let Some(image) = image {
-                                    tile.insert(ImageNode {
-                                        image_mode: NodeImageMode::Stretch,
-                                        ..ImageNode::new(image)
-                                    });
+                                    None
                                 }
-                                tile.with_children(|parent| {
-                                    if game.board.status == Status::Lost
-                                        && game.triggered_mine == Some(index)
-                                    {
-                                        parent.spawn((
-                                            TriggeredMineHighlight,
-                                            Node {
-                                                position_type: PositionType::Absolute,
-                                                width: percent(100),
-                                                height: percent(100),
-                                                border: UiRect::all(px(3.0 * scale)),
-                                                ..default()
-                                            },
-                                            BorderColor::all(Color::srgb(1.0, 0.85, 0.1)),
-                                            bevy::ui::FocusPolicy::Pass,
-                                        ));
-                                    }
-                                    let text_color = if cell.revealed && !show_mine {
-                                        number_color(cell.count)
-                                    } else {
-                                        Color::WHITE
-                                    };
-                                    parent.spawn(colored_label(text, 20.0 * scale, text_color));
+                            });
+                            let text = if image.is_some() {
+                                String::new()
+                            } else if show_mine {
+                                "*".into()
+                            } else if cell.flagged {
+                                "F".into()
+                            } else if cell.revealed && cell.count > 0 {
+                                cell.count.to_string()
+                            } else {
+                                String::new()
+                            };
+                            let color = if show_mine {
+                                Color::srgb(0.7, 0.16, 0.18)
+                            } else if cell.revealed {
+                                Color::srgb(0.12, 0.17, 0.23)
+                            } else if cell.flagged {
+                                Color::srgb(0.52, 0.36, 0.12)
+                            } else {
+                                Color::srgb(0.26, 0.34, 0.43)
+                            };
+                            let mut tile = parent.spawn((
+                                Button,
+                                Tile(index),
+                                Node {
+                                    width: px(tile_size),
+                                    height: px(tile_size),
+                                    align_items: AlignItems::Center,
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(color),
+                            ));
+                            if let Some(image) = image {
+                                tile.insert(ImageNode {
+                                    image_mode: NodeImageMode::Stretch,
+                                    ..ImageNode::new(image)
                                 });
                             }
-                        });
-                });
-        });
+                            tile.with_children(|parent| {
+                                if game.board.status == Status::Lost
+                                    && game.triggered_mine == Some(index)
+                                {
+                                    parent.spawn((
+                                        TriggeredMineHighlight,
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            width: percent(100),
+                                            height: percent(100),
+                                            border: UiRect::all(px(3.0 * scale)),
+                                            ..default()
+                                        },
+                                        BorderColor::all(Color::srgb(1.0, 0.85, 0.1)),
+                                        bevy::ui::FocusPolicy::Pass,
+                                    ));
+                                }
+                                let text_color = if cell.revealed && !show_mine {
+                                    number_color(cell.count)
+                                } else {
+                                    Color::WHITE
+                                };
+                                parent.spawn(colored_label(text, 20.0 * scale, text_color));
+                            });
+                        }
+                    });
+            });
+    });
 }
 
 fn build_win_screen(commands: &mut Commands, game: &Game, over: &GameOver) {
@@ -1551,15 +1698,19 @@ fn build_win_screen(commands: &mut Commands, game: &Game, over: &GameOver) {
                 ImageNode::new(game.win_image.clone()),
             ));
             parent
-                .spawn(Node {
-                    flex_direction: FlexDirection::Column,
-                    flex_grow: 1.0,
-                    min_width: px(0),
-                    max_height: percent(90),
-                    row_gap: px(10),
-                    overflow: Overflow::scroll_y(),
-                    ..default()
-                })
+                .spawn((
+                    ScoreViewport,
+                    ScrollPosition::default(),
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        flex_grow: 1.0,
+                        min_width: px(0),
+                        max_height: percent(90),
+                        row_gap: px(10),
+                        overflow: Overflow::scroll_y(),
+                        ..default()
+                    },
+                ))
                 .with_children(|parent| {
                     let mut highlighted = false;
                     if let Some(mode) = over.mode {
@@ -1578,6 +1729,12 @@ fn build_win_screen(commands: &mut Commands, game: &Game, over: &GameOver) {
                             Lookup::Ready => {
                                 let scores = mode_scores(mode, &game.online);
                                 let place = recorded_place(over, &game.online);
+                                if scores.iter().any(|score| score.id.is_some()) {
+                                    parent.spawn(label(
+                                        "Click a score to view its winning board on the website.",
+                                        14.0,
+                                    ));
+                                }
                                 if scores.is_empty() {
                                     parent.spawn(label("No scores yet.", 18.0));
                                 }
@@ -1585,43 +1742,7 @@ fn build_win_screen(commands: &mut Commands, game: &Game, over: &GameOver) {
                                     scores.iter().take(LEADERBOARD_SIZE).enumerate()
                                 {
                                     let selected = place == Some(index);
-                                    parent
-                                        .spawn(Node {
-                                            width: percent(100),
-                                            padding: UiRect::all(px(6)),
-                                            align_items: AlignItems::Center,
-                                            column_gap: px(8),
-                                            ..default()
-                                        })
-                                        .with_children(|row| {
-                                            let mut marker = row.spawn((
-                                                Node {
-                                                    width: px(9),
-                                                    height: px(14),
-                                                    flex_shrink: 0.0,
-                                                    ..default()
-                                                },
-                                                ImageNode::new(game.chevron.clone()),
-                                                if selected {
-                                                    Visibility::Inherited
-                                                } else {
-                                                    Visibility::Hidden
-                                                },
-                                            ));
-                                            if selected {
-                                                marker.insert(WinningScore);
-                                            }
-                                            row.spawn(label(
-                                                format!(
-                                                    "{}. {}{} - {:.2}s",
-                                                    index + 1,
-                                                    score.player_name,
-                                                    if score.user_id.is_none() { " *" } else { "" },
-                                                    score.elapsed_ms as f64 / 1000.0
-                                                ),
-                                                18.0,
-                                            ));
-                                        });
+                                    score_row(parent, game, index, score, 18.0, Some(selected));
                                     if selected {
                                         highlighted = true;
                                     }
@@ -1640,6 +1761,13 @@ fn build_win_screen(commands: &mut Commands, game: &Game, over: &GameOver) {
                         }
                     }
                     parent.spawn(label(recording_text(over, &game.online), 16.0));
+                    if game
+                        .online
+                        .message
+                        .starts_with("Cannot open winning board:")
+                    {
+                        parent.spawn(colored_label(&game.online.message, 16.0, number_color(3)));
+                    }
                 });
         });
 }
@@ -1798,6 +1926,29 @@ fn scroll_board(
     }
 }
 
+fn scroll_scores(
+    mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut viewports: Query<(&ComputedNode, &mut ScrollPosition), With<ScoreViewport>>,
+) {
+    for event in wheel.read() {
+        let unit = match event.unit {
+            bevy::input::mouse::MouseScrollUnit::Line => 40.0,
+            bevy::input::mouse::MouseScrollUnit::Pixel => 1.0,
+        };
+        let delta = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+            Vec2::new(event.y + event.x, 0.0)
+        } else {
+            Vec2::new(event.x, event.y)
+        };
+        for (node, mut position) in &mut viewports {
+            let max =
+                (node.content_size() - node.size()).max(Vec2::ZERO) * node.inverse_scale_factor;
+            position.0 = (position.0 - delta * unit).clamp(Vec2::ZERO, max);
+        }
+    }
+}
+
 fn rebuild(commands: &mut Commands, screen: &Query<Entity, With<Screen>>, game: &Game) {
     for entity in screen.iter() {
         commands.entity(entity).despawn();
@@ -1816,6 +1967,11 @@ fn new_board(game: &mut Game) {
     };
     game.board = Board::new(rows, columns, mines);
     game.triggered_mine = None;
+    game.auto_solver = false;
+    game.auto_solver_board = false;
+    game.auto_solver_idle = 0.0;
+    game.auto_solver_step = 0.0;
+    game.auto_solver_restart = None;
     game.last_move = None;
     game.elapsed = 0.0;
     game.board_scroll = Vec2::ZERO;
@@ -1831,6 +1987,150 @@ fn new_board(game: &mut Game) {
         };
         game.online.dispatch(Operation::Start { mode: mode.into() });
     }
+}
+
+fn interrupt_auto_solver(
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut game: ResMut<Game>,
+) {
+    if (game.auto_solver || game.auto_solver_restart.is_some())
+        && (keys.get_just_pressed().next().is_some() || mouse.get_just_pressed().next().is_some())
+    {
+        game.auto_solver = false;
+        game.auto_solver_restart = None;
+        game.auto_solver_idle = 0.0;
+    }
+}
+
+fn run_auto_solver(
+    mut commands: Commands,
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut game: ResMut<Game>,
+    screen: Query<Entity, With<Screen>>,
+) {
+    if let Some(remaining) = game.auto_solver_restart {
+        let remaining = remaining - time.delta_secs();
+        if remaining <= 0.0 {
+            game.auto_solver_restart = None;
+            game.game_over = None;
+            start_auto_solver_game(&mut game);
+            rebuild(&mut commands, &screen, &game);
+        } else {
+            game.auto_solver_restart = Some(remaining);
+        }
+        return;
+    }
+    if game.auto_solver {
+        if game.board.status != Status::Playing {
+            game.auto_solver = false;
+            return;
+        }
+        game.auto_solver_step += time.delta_secs();
+        if game.auto_solver_step < 0.3 {
+            return;
+        }
+        game.auto_solver_step = 0.0;
+        if let Some((index, action)) = solver_move(&game.board) {
+            apply_move(&mut game, index, action);
+            if game.board.status != Status::Playing {
+                game.auto_solver = false;
+            }
+            rebuild(&mut commands, &screen, &game);
+        } else {
+            game.auto_solver = false;
+        }
+        return;
+    }
+    if (game.board.status == Status::Playing && game.board.cells.iter().any(|cell| cell.revealed))
+        || game.game_over.is_some()
+        || game.custom_dialog.is_some()
+        || game.help_open
+        || game.quit_confirmation
+        || game.connection.is_some()
+        || game.online.login_open
+        || game.online.show_scores
+        || game.online.busy()
+        || (game.board.status == Status::Won
+            && game.online.game_id.is_some()
+            && !game.online.submitted)
+    {
+        game.auto_solver_idle = 0.0;
+        return;
+    }
+    if keys.get_just_pressed().next().is_some() || mouse.get_just_pressed().next().is_some() {
+        game.auto_solver_idle = 0.0;
+        return;
+    }
+    game.auto_solver_idle += time.delta_secs();
+    if game.auto_solver_idle < AUTO_SOLVER_IDLE_SECONDS {
+        return;
+    }
+
+    start_auto_solver_game(&mut game);
+    rebuild(&mut commands, &screen, &game);
+}
+
+fn start_auto_solver_game(game: &mut Game) {
+    let enabled_boards: Vec<_> = AUTO_SOLVER_BOARD_CHOICES
+        .iter()
+        .filter_map(|(enabled, board)| enabled.then_some(*board))
+        .collect();
+    let (rows, columns, mines) = *enabled_boards
+        .choose(&mut rand::rng())
+        .expect("at least one autosolver board must be enabled");
+    game.board = Board::new(rows, columns, mines);
+    game.custom = false;
+    game.auto_solver = true;
+    game.auto_solver_board = true;
+    game.auto_solver_idle = 0.0;
+    game.auto_solver_step = 0.0;
+    game.triggered_mine = None;
+    game.last_move = None;
+    game.elapsed = 0.0;
+    game.board_scroll = Vec2::ZERO;
+    game.online.game_id = None;
+    game.online.needs_refresh = false;
+    game.online.submitted = false;
+    let first = rand::random_range(0..game.board.cells.len());
+    apply_move(game, first, "reveal");
+}
+
+fn solver_move(board: &Board) -> Option<(usize, &'static str)> {
+    let mut deductions = Vec::new();
+    for (index, cell) in board.cells.iter().enumerate() {
+        if !cell.revealed || cell.count == 0 {
+            continue;
+        }
+        let neighbors = board.neighbors(index);
+        let flags = neighbors
+            .iter()
+            .filter(|&&neighbor| board.cells[neighbor].flagged)
+            .count();
+        let covered: Vec<_> = neighbors
+            .into_iter()
+            .filter(|&neighbor| !board.cells[neighbor].revealed && !board.cells[neighbor].flagged)
+            .collect();
+        if covered.is_empty() {
+            continue;
+        }
+        if flags == usize::from(cell.count) {
+            deductions.extend(covered.into_iter().map(|neighbor| (neighbor, "reveal")));
+        } else if flags + covered.len() == usize::from(cell.count) {
+            deductions.extend(covered.into_iter().map(|neighbor| (neighbor, "flag")));
+        }
+    }
+    deductions.into_iter().next().or_else(|| {
+        let covered: Vec<_> = board
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| (!cell.revealed && !cell.flagged).then_some(index))
+            .collect();
+        (!covered.is_empty()).then(|| (covered[rand::random_range(0..covered.len())], "reveal"))
+    })
 }
 
 fn start_custom(game: &mut Game) {
@@ -1909,7 +2209,7 @@ fn keyboard(
         return;
     }
     if game.game_over.is_some() {
-        if keys.just_pressed(KeyCode::Escape) {
+        if game.auto_solver_restart.is_none() && keys.just_pressed(KeyCode::Escape) {
             game.game_over = None;
             rebuild(&mut commands, &screen, &game);
         }
@@ -2091,7 +2391,16 @@ fn controls(
                     settings.mines = (settings.mines as i32 + delta).max(1) as usize;
                 }
             }
-            Action::Login => game.online.login_open = true,
+            Action::Login => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    game.online.login_open = true;
+                }
+                #[cfg(target_arch = "wasm32")]
+                if let Err(error) = online::web::navigate("/admin/login?next=makibishi") {
+                    game.online.message = error;
+                }
+            }
             Action::Username => game.online.password_focus = false,
             Action::Password => game.online.password_focus = true,
             Action::Remember => game.online.remember = !game.online.remember,
@@ -2101,11 +2410,23 @@ fn controls(
                 game.online.password.clear();
             }
             Action::Logout => {
+                #[cfg(not(target_arch = "wasm32"))]
                 game.online.dispatch(Operation::Logout);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    game.online.message = "Use the website navigation to sign out.".into();
+                }
             }
             Action::Ranked => {
                 if game.online.session.is_none() {
-                    game.online.login_open = true;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        game.online.login_open = true;
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    if let Err(error) = online::web::navigate("/admin/login?next=makibishi") {
+                        game.online.message = error;
+                    }
                 } else {
                     game.online.ranked = !game.online.ranked;
                     new_board(&mut game);
@@ -2139,13 +2460,46 @@ fn controls(
     }
 }
 
+fn open_score_links(
+    mut commands: Commands,
+    links: Query<(&Interaction, &ScoreLink), Changed<Interaction>>,
+    mut game: ResMut<Game>,
+    screen: Query<Entity, With<Screen>>,
+) {
+    for (interaction, link) in &links {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let result = game.online.score_url(link.0).and_then(|url| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                webbrowser::open(&url).map_err(|error| error.to_string())
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                online::web::open(&url)
+            }
+        });
+        if let Err(error) = result {
+            game.online.message = format!("Cannot open winning board: {error}");
+            rebuild(&mut commands, &screen, &game);
+        }
+        break;
+    }
+}
+
 fn dismiss_game_over_on_click(
     mut commands: Commands,
     mouse: Res<ButtonInput<MouseButton>>,
     mut game: ResMut<Game>,
     screen: Query<Entity, With<Screen>>,
+    links: Query<&Interaction, With<ScoreLink>>,
 ) {
     if game.game_over.is_some()
+        && !links
+            .iter()
+            .any(|interaction| *interaction != Interaction::None)
+        && game.auto_solver_restart.is_none()
         && !game.quit_confirmation
         && mouse.get_just_pressed().next().is_some()
     {
@@ -2177,6 +2531,7 @@ fn tiles(
         || game.online.show_scores
         || (game.online.ranked
             && !game.custom
+            && !game.auto_solver_board
             && (game.online.busy() || game.online.game_id.is_none() || game.online.needs_refresh))
     {
         return;
@@ -2306,6 +2661,12 @@ fn finish_game(game: &mut Game, elapsed_ms: u64) {
     if !won {
         game.ruru.record_mine_hit();
     }
+    if game.auto_solver && game.auto_solver_board {
+        game.auto_solver = false;
+        game.auto_solver_restart = Some(AUTO_SOLVER_RESTART_SECONDS);
+        game.game_over = None;
+        return;
+    }
     let reason = if won {
         "Every safe tile was cleared.".to_string()
     } else {
@@ -2327,6 +2688,8 @@ fn finish_game(game: &mut Game, elapsed_ms: u64) {
     let mode = leaderboard_mode(game);
     let recording = if !won {
         Recording::Lost
+    } else if game.auto_solver_board {
+        Recording::Offline
     } else if game.online.game_id.is_some() {
         if game.online.submitted {
             Recording::Recorded
@@ -2344,7 +2707,7 @@ fn finish_game(game: &mut Game, elapsed_ms: u64) {
         elapsed_ms,
         mode,
         recording,
-        lookup: if won && mode.is_some() {
+        lookup: if won && mode.is_some() && !game.auto_solver_board {
             Lookup::Waiting
         } else {
             Lookup::NotApplicable
@@ -2677,7 +3040,16 @@ fn handle_online_reply(game: &mut Game, result: Result<Reply, online::ApiError>)
             game.online.message = error.message;
             if error.unauthorized {
                 game.online.session = None;
-                game.online.login_open = true;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    game.online.login_open = true;
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    game.online
+                        .message
+                        .push_str(" Sign in again using the website.");
+                }
                 if game.online.ranked || game.online.game_id.is_some() {
                     game.online.ranked = false;
                     new_board(game);
@@ -2730,7 +3102,17 @@ fn handle_online_reply(game: &mut Game, result: Result<Reply, online::ApiError>)
                     let was_playing = game.board.status == Status::Playing;
                     let recovered = game.connection.take();
                     match view.into_board() {
-                        Ok((id, board, elapsed)) => {
+                        Ok((id, mut board, elapsed)) => {
+                            if board.status == Status::Lost
+                                && board.rows == game.board.rows
+                                && board.columns == game.board.columns
+                            {
+                                for (index, cell) in board.cells.iter_mut().enumerate() {
+                                    if !cell.mine {
+                                        cell.revealed &= game.board.cells[index].revealed;
+                                    }
+                                }
+                            }
                             if was_playing {
                                 game.triggered_mine = online_triggered_mine(game, &board);
                             } else if board.status == Status::Playing {
@@ -2884,6 +3266,7 @@ mod tests {
         for chord in [false, true] {
             let mut game = Game::default();
             game.board.started = true;
+            game.board.cells[30].revealed = true;
             game.last_move = Some((
                 if chord { 10 } else { 20 },
                 if chord { "chord" } else { "reveal" },
@@ -2898,6 +3281,8 @@ mod tests {
                 json["cells"][index]["mine"] = true.into();
                 json["cells"][index]["revealed"] = true.into();
             }
+            json["cells"][15]["revealed"] = true.into();
+            json["cells"][30]["revealed"] = true.into();
             for dismissed in [false, true] {
                 if dismissed {
                     game.game_over = None;
@@ -2907,6 +3292,8 @@ mod tests {
                     Ok(Reply::Board(serde_json::from_value(json.clone()).unwrap())),
                 );
                 assert_eq!(game.triggered_mine, Some(20));
+                assert!(!game.board.cells[15].revealed);
+                assert!(game.board.cells[30].revealed);
                 let mut app = App::new();
                 let mut queue = bevy::ecs::world::CommandQueue::default();
                 build_screen(&mut Commands::new(&mut queue, app.world()), &game);
@@ -2921,6 +3308,259 @@ mod tests {
             assert_eq!(game.triggered_mine, None);
             assert_eq!(game.last_move, None);
         }
+    }
+
+    #[test]
+    fn autosolver_flags_forced_mines_and_reveals_forced_safe_tiles() {
+        let mut board = Board::new(2, 3, 1);
+        board.cells[1].revealed = true;
+        board.cells[1].count = 1;
+        for index in [0, 2, 3, 4] {
+            board.cells[index].revealed = true;
+        }
+        assert_eq!(solver_move(&board), Some((5, "flag")));
+
+        let mut board = Board::new(2, 2, 1);
+        board.cells[0].flagged = true;
+        board.cells[3].revealed = true;
+        board.cells[3].count = 1;
+        let (index, action) = solver_move(&board).unwrap();
+        assert_eq!(action, "reveal");
+        assert!([1, 2].contains(&index));
+    }
+
+    #[test]
+    fn autosolver_fallback_reveals_a_random_covered_tile() {
+        let board = Board::new(5, 5, 3);
+        let (index, action) = solver_move(&board).unwrap();
+        assert_eq!(action, "reveal");
+        assert!(!board.cells[index].revealed);
+        assert!(!board.cells[index].flagged);
+    }
+
+    #[test]
+    fn autosolver_board_finishes_unranked_without_score_lookup() {
+        let mut game = Game::default();
+        game.board.status = Status::Won;
+        game.auto_solver_board = true;
+        finish_game(&mut game, 1234);
+        let over = game.game_over.as_ref().unwrap();
+        assert_eq!(over.recording, Recording::Offline);
+        assert_eq!(over.lookup, Lookup::NotApplicable);
+        assert!(!game.online.busy());
+    }
+
+    #[test]
+    fn autosolver_stops_on_key_or_mouse_input_without_replacing_board() {
+        for key_input in [true, false] {
+            let mut game = Game::default();
+            game.auto_solver = true;
+            game.auto_solver_board = true;
+            game.board.started = true;
+            game.board.cells[10].revealed = true;
+            let mut app = App::new();
+            app.insert_resource(game)
+                .init_resource::<ButtonInput<KeyCode>>()
+                .init_resource::<ButtonInput<MouseButton>>()
+                .add_systems(Update, interrupt_auto_solver);
+            if key_input {
+                app.world_mut()
+                    .resource_mut::<ButtonInput<KeyCode>>()
+                    .press(KeyCode::KeyF);
+            } else {
+                app.world_mut()
+                    .resource_mut::<ButtonInput<MouseButton>>()
+                    .press(MouseButton::Left);
+            }
+            app.update();
+            let game = app.world().resource::<Game>();
+            assert!(!game.auto_solver);
+            assert!(game.auto_solver_board);
+            assert!(game.board.started);
+            assert!(game.board.cells[10].revealed);
+        }
+    }
+
+    #[test]
+    fn autosolver_starts_a_random_standard_board_after_idle() {
+        let mut app = App::new();
+        app.insert_resource(Game::default())
+            .init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_systems(Update, run_auto_solver);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(20));
+        app.update();
+        let game = app.world().resource::<Game>();
+        assert!(game.auto_solver);
+        assert!(game.auto_solver_board);
+        assert!(game.board.started);
+        assert!(matches!(
+            (game.board.rows, game.board.columns, game.board.mines),
+            (16, 30, 99)
+        ));
+        assert!(game.online.game_id.is_none());
+    }
+
+    #[test]
+    fn autosolver_treats_an_unrevealed_flagged_board_as_no_active_game() {
+        let mut game = Game::default();
+        game.board.flag(0);
+        let mut app = App::new();
+        app.insert_resource(game)
+            .init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_systems(Update, run_auto_solver);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(20));
+        app.update();
+
+        let game = app.world().resource::<Game>();
+        assert!(game.auto_solver);
+        assert_eq!(
+            (game.board.rows, game.board.columns, game.board.mines),
+            (16, 30, 99)
+        );
+    }
+
+    #[test]
+    fn autosolver_starts_after_a_completed_game_is_dismissed() {
+        let mut game = Game::default();
+        game.board.status = Status::Won;
+        game.board.started = true;
+        game.auto_solver_board = true;
+        game.game_over = Some(won_over(1000, Recording::Offline));
+        let mut app = App::new();
+        app.insert_resource(game)
+            .init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_systems(Update, run_auto_solver);
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(20));
+        app.update();
+        assert!(!app.world().resource::<Game>().auto_solver);
+
+        {
+            let mut game = app.world_mut().resource_mut::<Game>();
+            game.game_over = None;
+        }
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(20));
+        app.update();
+
+        let game = app.world().resource::<Game>();
+        assert!(game.auto_solver);
+        assert!(game.game_over.is_none());
+    }
+
+    #[test]
+    fn autosolver_restarts_after_five_seconds_without_showing_results() {
+        for status in [Status::Won, Status::Lost] {
+            let mut game = Game::default();
+            game.board = Board::new(16, 30, 99);
+            game.board.started = true;
+            game.board.status = status;
+            game.auto_solver = true;
+            game.auto_solver_board = true;
+            finish_game(&mut game, 1000);
+            assert_eq!(game.auto_solver_restart, Some(5.0));
+            assert!(game.game_over.is_none());
+            assert!(!game.online.busy());
+
+            let mut app = App::new();
+            app.insert_resource(game)
+                .init_resource::<Time>()
+                .init_resource::<ButtonInput<KeyCode>>()
+                .init_resource::<ButtonInput<MouseButton>>()
+                .add_systems(Update, run_auto_solver);
+
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs(4));
+            app.update();
+            let game = app.world().resource::<Game>();
+            assert!(game.game_over.is_none());
+            assert!(!game.auto_solver);
+            assert_eq!(game.board.status, status);
+            assert_eq!(game.auto_solver_restart, Some(1.0));
+
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs(1));
+            app.update();
+            let game = app.world().resource::<Game>();
+            assert!(game.game_over.is_none());
+            assert!(game.auto_solver);
+            assert!(game.auto_solver_board);
+            assert_eq!(
+                (game.board.rows, game.board.columns, game.board.mines),
+                (16, 30, 99)
+            );
+            assert!(game.board.started);
+        }
+    }
+
+    #[test]
+    fn input_cancels_the_autosolver_restart_pause() {
+        for key_input in [true, false] {
+            let mut game = Game::default();
+            game.board.status = Status::Lost;
+            game.auto_solver_board = true;
+            game.auto_solver_restart = Some(5.0);
+            let mut app = App::new();
+            app.insert_resource(game)
+                .init_resource::<Time>()
+                .init_resource::<ButtonInput<KeyCode>>()
+                .init_resource::<ButtonInput<MouseButton>>()
+                .add_systems(Update, (interrupt_auto_solver, run_auto_solver).chain());
+            if key_input {
+                app.world_mut()
+                    .resource_mut::<ButtonInput<KeyCode>>()
+                    .press(KeyCode::Space);
+            } else {
+                app.world_mut()
+                    .resource_mut::<ButtonInput<MouseButton>>()
+                    .press(MouseButton::Left);
+            }
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_secs(5));
+            app.update();
+            let game = app.world().resource::<Game>();
+            assert!(game.auto_solver_restart.is_none());
+            assert!(!game.auto_solver);
+            assert_eq!(game.board.status, Status::Lost);
+            assert_eq!(game.auto_solver_idle, 0.0);
+        }
+    }
+
+    #[test]
+    fn autosolver_waits_while_a_playing_board_has_revealed_tiles() {
+        let mut game = Game::default();
+        game.board.started = true;
+        game.board.cells[0].revealed = true;
+        let mut app = App::new();
+        app.insert_resource(game)
+            .init_resource::<Time>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_systems(Update, run_auto_solver);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(20));
+        app.update();
+
+        assert!(!app.world().resource::<Game>().auto_solver);
+        assert_eq!(app.world().resource::<Game>().auto_solver_idle, 0.0);
+        assert!(app.world().resource::<Game>().board.started);
     }
 
     #[test]
@@ -3020,7 +3660,7 @@ mod tests {
             >();
             let (node, color, z, children) = overlay.single(app.world()).unwrap();
             assert_eq!(node.flex_direction, FlexDirection::Row);
-            assert_eq!(color.0.alpha(), 0.8);
+            assert_eq!(color.0.alpha(), 0.9);
             assert!(z.0 < 30);
             assert_eq!(children.len(), 2);
             assert_eq!(
@@ -3964,6 +4604,19 @@ mod tests {
     }
 
     #[test]
+    fn web_font_contains_danish_japanese_and_separator_glyphs() {
+        let face = ttf_parser::Face::parse(WEB_FONT, 0).unwrap();
+        for character in "\u{00e6}\u{00f8}\u{00e5}\u{00c6}\u{00d8}\u{00c5}\u{00b7}\u{2014}\u{30eb}\u{30eb} doesn't judge.. Makibishi: 0 Time: 1.0s"
+            .chars()
+        {
+            assert!(
+                face.glyph_index(character).is_some(),
+                "Missing glyph for {character}"
+            );
+        }
+    }
+
+    #[test]
     fn request_status_keeps_a_fixed_slot_and_hides_refresh_during_move() {
         let (online, worker) = online::tests::starting_online();
         let mut game = Game {
@@ -4768,10 +5421,101 @@ mod tests {
 
     fn score(player_name: &str, elapsed_ms: u64) -> online::Score {
         online::Score {
+            id: None,
             player_name: player_name.into(),
             user_id: Some(1),
             elapsed_ms,
+            board: None,
         }
+    }
+
+    #[test]
+    fn both_leaderboards_show_clickable_winning_board_miniatures() {
+        for results in [false, true] {
+            let mut game = Game::default();
+            let mut score = score("Player", 1000);
+            score.id = Some(42);
+            score.board = Some(online::WinningBoard {
+                rows: 9,
+                columns: 9,
+                cells: (0..81)
+                    .map(|index| board::Cell {
+                        mine: index < 10,
+                        flagged: index < 10,
+                        revealed: index >= 10,
+                        count: 1,
+                    })
+                    .collect(),
+            });
+            game.online.scores.easy.push(score);
+            game.online.scores_loaded = true;
+            game.online.show_scores = !results;
+            if results {
+                let mut over = won_over(1000, Recording::Offline);
+                over.mode = Some("easy");
+                game.game_over = Some(over);
+            }
+            let mut app = App::new();
+            app.insert_resource(game);
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            build_screen(
+                &mut Commands::new(&mut queue, app.world()),
+                app.world().resource::<Game>(),
+            );
+            queue.apply(app.world_mut());
+            let mut links = app.world_mut().query::<(&ScoreLink, &Children)>();
+            let (link, children) = links.single(app.world()).unwrap();
+            assert_eq!(link.0, 42);
+            assert!(
+                children
+                    .iter()
+                    .any(|child| app.world().get::<ScorePreview>(child).is_some())
+            );
+            let mut previews = app
+                .world_mut()
+                .query_filtered::<(&Node, &Children), With<ScorePreview>>();
+            let (node, children) = previews.single(app.world()).unwrap();
+            assert_eq!(node.grid_template_columns.len(), 9);
+            assert_eq!(children.len(), 81);
+            assert_eq!(
+                app.world_mut()
+                    .query_filtered::<Entity, With<ScoreViewport>>()
+                    .iter(app.world())
+                    .count(),
+                1
+            );
+
+            if results {
+                app.init_resource::<ButtonInput<MouseButton>>()
+                    .add_systems(Update, dismiss_game_over_on_click);
+                let link_entity = app
+                    .world_mut()
+                    .query_filtered::<Entity, With<ScoreLink>>()
+                    .single(app.world())
+                    .unwrap();
+                app.world_mut()
+                    .entity_mut(link_entity)
+                    .insert(Interaction::Pressed);
+                app.world_mut()
+                    .resource_mut::<ButtonInput<MouseButton>>()
+                    .press(MouseButton::Left);
+                app.update();
+                assert!(app.world().resource::<Game>().game_over.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn winning_board_link_errors_are_reported_without_opening_a_browser() {
+        let mut app = App::new();
+        app.init_resource::<Game>()
+            .add_systems(Update, open_score_links);
+        app.world_mut().spawn((Interaction::Pressed, ScoreLink(0)));
+        app.update();
+        assert_eq!(
+            app.world().resource::<Game>().online.message,
+            "Cannot open winning board: The server returned an invalid score ID."
+        );
     }
 
     fn won_over(elapsed_ms: u64, recording: Recording) -> GameOver {

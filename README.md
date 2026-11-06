@@ -59,8 +59,9 @@ The first revealed cell is always safe.
 - Losing displays `gfx/MonkOuch.png` centered over a darkened background instead
   of a modal. Ruru remains undimmed when visible. Any mouse click or **Escape**
   dismisses the picture without activating the controls behind it.
-  The triggered makibishi stays outlined in yellow on the board until a new
-  game starts, including when a misplaced chord flag caused the loss.
+  Makibishi are revealed, but untouched safe tiles stay covered. The triggered
+  makibishi stays outlined in yellow on the board until a new game starts,
+  including when a misplaced chord flag caused the loss.
 - Winning shows `gfx/MonkAtRest.png` on the left over a darkened background, with
   the current mode's top ten on the right. A chevron marks the just-recorded score;
   if absent, their time appears below the board. Unrecorded games always show
@@ -80,6 +81,16 @@ The first revealed cell is always safe.
   has clickable account/mode and leaderboard controls on the left, status and
   error messages in the center, and flag/help/zoom/fullscreen controls on the
   right. Offline indicators are red, including the status beneath the banner.
+- After 20 seconds without keyboard or mouse input, an advanced board starts an
+  autosolver if no game is in progress. A playing board with no revealed tiles
+  counts as no game; a completed game counts as no game after its result is
+  dismissed. Its board choices can be enabled or disabled in
+  `AUTO_SOLVER_BOARD_CHOICES`. It flags deduced makibishi, reveals deduced safe
+  tiles and guesses a random covered tile when needed. Any key or mouse press
+  stops it; the board remains available to finish manually and never submits a
+  high score. Autosolver wins and losses show no result overlay; the finished
+  board stays visible for five seconds before another attempt starts.
+  Key or mouse input also cancels this pause and automatic restart.
 
 ## Account integration
 
@@ -114,6 +125,11 @@ Custom games remain offline and unranked.
 **Online leaderboard** shows the shared website's top ten scores for Beginner,
 Intermediate and Advanced. Guest entries are marked `*`; account entries use
 their current Display Name. Server validation does not prevent automated play.
+New scores include a server-saved winning board. Both leaderboard views show a
+miniature alongside each saved board; click a score to open its board page in
+the default browser, using the configured server. Older scores may have no board
+snapshot; servers predating this feature remain supported without previews.
+Offline and autosolver boards are never uploaded.
 
 The default server is `https://wasd.dk`. It needs the new `/api/player` routes
 from the corresponding wasd5 server changes deployed before login can work.
@@ -140,3 +156,37 @@ with an explicit error.
 ```powershell
 cargo test
 ```
+
+## Browser / WASM
+
+The browser version runs at `/games/makibishi` on wasd5, using WebGL2 and the
+website's existing login cookies and CSRF protection. Signed-in players start
+ranked games through the browser API; visitors can play offline. Sign in through
+the website, not the native client's password or remembered-token dialog.
+Custom settings use browser local storage. Browser sound requires user
+interaction; system fonts and Windows Credential Manager are not used. Instead
+the WASM binary embeds `assets/fonts/MakibishiWeb.ttf`, a Noto Sans JP subset
+(SIL Open Font License, see `assets/fonts/OFL.txt`) that covers Latin-1
+(including æ, ø, å), common punctuation and kana.
+
+Install the target and matching binding generator once:
+
+```powershell
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
+```
+
+Keep the CLI version aligned with `wasm-bindgen` in `Cargo.lock`.
+Build and copy the WASM bundle plus graphics/sound into the server:
+
+```powershell
+.\scripts\build-wasm.ps1 -ServerRoot ..\wasd5
+```
+
+The script defaults to release builds; `-DebugBuild` is available for local
+checks. It stages the bundle under `target\makibishi-web` and deploys
+`makibishi.js`, `makibishi_bg.wasm`, `gfx` and `sfx` to
+`wasd5\static\makibishi`. Deploy that whole directory alongside the server's
+Makibishi page and loader. Generated files are not source files.
+`MINESWEEPER_SERVER` applies only to the native client; WASM uses the hosting
+website's origin. The server must serve `.wasm` as `application/wasm`.

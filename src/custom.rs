@@ -31,6 +31,7 @@ impl Settings {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn path() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let root = std::env::var_os("LOCALAPPDATA")
@@ -44,6 +45,7 @@ pub fn path() -> Result<PathBuf, String> {
     Ok(root.join("minesweeper-bevy").join("custom.json"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load(path: &Path) -> Result<Settings, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -57,6 +59,7 @@ pub fn load(path: &Path) -> Result<Settings, String> {
         .validate()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn save(path: &Path, settings: Settings) -> Result<(), String> {
     settings.validate()?;
     let bytes = serde_json::to_vec(&settings)
@@ -65,6 +68,43 @@ pub fn save(path: &Path, settings: Settings) -> Result<(), String> {
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("Cannot create custom settings directory: {error}"))?;
     std::fs::write(path, bytes).map_err(|error| format!("Cannot save custom settings: {error}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn path() -> Result<PathBuf, String> {
+    Ok(PathBuf::from("makibishi-custom"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn storage() -> Result<web_sys::Storage, String> {
+    web_sys::window()
+        .ok_or("Browser window is unavailable.")?
+        .local_storage()
+        .map_err(|error| format!("Cannot access custom settings: {error:?}"))?
+        .ok_or("Browser storage is unavailable.".into())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load(_path: &Path) -> Result<Settings, String> {
+    match storage()?
+        .get_item("makibishi-custom")
+        .map_err(|error| format!("Cannot read custom settings: {error:?}"))?
+    {
+        Some(value) => serde_json::from_str::<Settings>(&value)
+            .map_err(|error| format!("Cannot parse custom settings: {error}"))?
+            .validate(),
+        None => Ok(Settings::default()),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn save(_path: &Path, settings: Settings) -> Result<(), String> {
+    settings.validate()?;
+    let value = serde_json::to_string(&settings)
+        .map_err(|error| format!("Cannot encode custom settings: {error}"))?;
+    storage()?
+        .set_item("makibishi-custom", &value)
+        .map_err(|error| format!("Cannot save custom settings: {error:?}"))
 }
 
 #[cfg(test)]

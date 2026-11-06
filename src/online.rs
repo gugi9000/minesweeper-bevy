@@ -1,18 +1,26 @@
-use std::{
-    sync::{
-        Mutex,
-        mpsc::{self, Receiver, TryRecvError},
-    },
-    time::Duration,
+use std::sync::{
+    Mutex,
+    mpsc::{self, Receiver, TryRecvError},
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest::{
     Url,
     blocking::{Client, RequestBuilder},
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::Deserialize;
+#[cfg(not(target_arch = "wasm32"))]
+use serde::de::DeserializeOwned;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 
 use crate::board::{Board, Cell, Status};
+
+#[cfg(target_arch = "wasm32")]
+#[path = "online_web.rs"]
+pub(crate) mod web;
+#[cfg(target_arch = "wasm32")]
+use web::Api;
 
 #[derive(Deserialize)]
 pub struct Session {
@@ -20,6 +28,7 @@ pub struct Session {
     pub display_name: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Deserialize)]
 struct Profile {
     display_name: String,
@@ -81,9 +90,50 @@ fn uuid_like(id: &str) -> Option<&str> {
 
 #[derive(Deserialize)]
 pub struct Score {
+    #[serde(default)]
+    pub id: Option<i32>,
     pub player_name: String,
     pub user_id: Option<i32>,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub board: Option<WinningBoard>,
+}
+
+#[derive(Deserialize)]
+#[serde(try_from = "WinningBoardData")]
+pub struct WinningBoard {
+    pub rows: usize,
+    pub columns: usize,
+    pub cells: Vec<Cell>,
+}
+
+#[derive(Deserialize)]
+struct WinningBoardData {
+    rows: usize,
+    columns: usize,
+    cells: Vec<Cell>,
+}
+
+impl TryFrom<WinningBoardData> for WinningBoard {
+    type Error = String;
+
+    fn try_from(board: WinningBoardData) -> Result<Self, Self::Error> {
+        if !(5..=24).contains(&board.rows)
+            || !(5..=30).contains(&board.columns)
+            || board.cells.len() != board.rows * board.columns
+            || board
+                .cells
+                .iter()
+                .any(|cell| cell.count > 8 || (!cell.mine && !cell.revealed))
+        {
+            return Err("The server returned an invalid winning board.".into());
+        }
+        Ok(Self {
+            rows: board.rows,
+            columns: board.columns,
+            cells: board.cells,
+        })
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -146,6 +196,7 @@ impl From<String> for ApiError {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 struct Api {
     client: Client,
@@ -154,6 +205,7 @@ struct Api {
     credential_service: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Api {
     fn new(base: &str) -> Result<Self, String> {
         let url = Url::parse(base).map_err(|error| format!("Invalid server URL: {error}"))?;
@@ -354,6 +406,7 @@ impl Api {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn response<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, ApiError> {
     let response = request.send().map_err(|error| ApiError {
         message: format!("Cannot reach the server: {}", error.without_url()),
@@ -408,11 +461,14 @@ pub struct Online {
 
 impl Default for Online {
     fn default() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let api = match std::env::var("MINESWEEPER_SERVER") {
             Ok(base) => Api::new(&base),
             Err(std::env::VarError::NotPresent) => Api::new("https://wasd.dk"),
             Err(error) => Err(format!("Invalid MINESWEEPER_SERVER: {error}")),
         };
+        #[cfg(target_arch = "wasm32")]
+        let api = Api::new();
         Self {
             message: api.as_ref().err().cloned().unwrap_or_default(),
             api,
@@ -437,6 +493,14 @@ impl Default for Online {
 }
 
 impl Online {
+    pub fn score_url(&self, id: i32) -> Result<String, String> {
+        if id <= 0 {
+            return Err("The server returned an invalid score ID.".into());
+        }
+        let api = self.api.as_ref().map_err(Clone::clone)?;
+        Ok(format!("{}/games/minesweeper/scores/{id}", api.base))
+    }
+
     pub fn busy(&self) -> bool {
         self.pending.is_some()
     }
@@ -452,6 +516,7 @@ impl Online {
                 return;
             }
         };
+        #[cfg(not(target_arch = "wasm32"))]
         let token = self.session.as_ref().map(|s| s.token.clone());
         let game_operation = matches!(
             operation,
@@ -462,6 +527,17 @@ impl Online {
         )
         .then(|| operation.clone());
         let (sender, receiver) = mpsc::channel();
+        #[cfg(target_arch = "wasm32")]
+        {
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = api.execute(operation).await;
+                let _ = sender.send(result);
+            });
+            self.pending = Some(Mutex::new(receiver));
+            self.last_game_operation = game_operation;
+            self.message = "Contacting server...".into();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         match std::thread::Builder::new()
             .name("minesweeper-network".into())
             .spawn(move || {
@@ -503,6 +579,46 @@ pub(crate) mod tests {
         thread::JoinHandle,
         time::Instant,
     };
+
+    #[test]
+    fn leaderboard_scores_support_legacy_and_winning_board_records() {
+        let legacy = serde_json::json!({
+            "player_name": "Player", "user_id": 1, "elapsed_ms": 1000
+        });
+        let score: Score = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(score.id.is_none());
+        assert!(score.board.is_none());
+
+        let mut saved = legacy;
+        saved["id"] = 42.into();
+        saved["board"] = serde_json::json!({
+            "rows": 9, "columns": 9,
+            "cells": (0..81).map(|index| serde_json::json!({
+                "mine": index < 10, "revealed": index >= 10,
+                "flagged": index < 10, "count": 1
+            })).collect::<Vec<_>>()
+        });
+        let score: Score = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(score.id, Some(42));
+        assert_eq!(score.board.unwrap().cells.len(), 81);
+
+        saved["board"]["rows"] = 0.into();
+        assert!(serde_json::from_value::<Score>(saved).is_err());
+    }
+
+    #[test]
+    fn winning_board_links_use_the_configured_origin() {
+        let online = Online {
+            api: Ok(Api::new("http://127.0.0.1:8000").unwrap()),
+            ..Online::default()
+        };
+        assert_eq!(
+            online.score_url(42).unwrap(),
+            "http://127.0.0.1:8000/games/minesweeper/scores/42"
+        );
+        assert!(online.score_url(0).is_err());
+        assert!(online.score_url(-1).is_err());
+    }
 
     fn mock_api(replies: Vec<(u16, serde_json::Value)>) -> (Api, JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
